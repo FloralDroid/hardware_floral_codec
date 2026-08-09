@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- Static limits describe the Floral component contract. The vendor Codec2
+     store publishes only entries supported by the active VA-API driver. -->
+<MediaCodecs>
+    <Decoders>
+        <MediaCodec name="c2.floral.avc.decoder" type="video/avc">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="16-65536" />
+            <Limit name="blocks-per-second" range="16-3932160" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.floral.hevc.decoder" type="video/hevc">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="8x8" />
+            <Limit name="block-count" range="64-262144" />
+            <Limit name="blocks-per-second" range="64-15728640" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.floral.vp8.decoder" type="video/x-vnd.on2.vp8">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="16-65536" />
+            <Limit name="blocks-per-second" range="16-3932160" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.floral.vp9.decoder" type="video/x-vnd.on2.vp9">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="16-65536" />
+            <Limit name="blocks-per-second" range="16-3932160" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.floral.av1.decoder" type="video/av01">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="16-65536" />
+            <Limit name="blocks-per-second" range="16-3932160" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.floral.mpeg2.decoder" type="video/mpeg2">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="16-65536" />
+            <Limit name="blocks-per-second" range="16-3932160" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+    </Decoders>
+
+    <Encoders>
+        <MediaCodec name="c2.floral.avc.encoder" type="video/avc">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="16-65536" />
+            <Limit name="blocks-per-second" range="16-3932160" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="bitrate-modes" value="VBR,CBR" />
+        </MediaCodec>
+        <MediaCodec name="c2.floral.hevc.encoder" type="video/hevc">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="8x8" />
+            <Limit name="block-count" range="64-262144" />
+            <Limit name="blocks-per-second" range="64-15728640" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="bitrate-modes" value="VBR,CBR" />
+        </MediaCodec>
+        <MediaCodec name="c2.floral.vp8.encoder" type="video/x-vnd.on2.vp8">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="16-65536" />
+            <Limit name="blocks-per-second" range="16-3932160" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="bitrate-modes" value="VBR,CBR" />
+        </MediaCodec>
+        <MediaCodec name="c2.floral.vp9.encoder" type="video/x-vnd.on2.vp9">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="16-65536" />
+            <Limit name="blocks-per-second" range="16-3932160" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="bitrate-modes" value="VBR,CBR" />
+        </MediaCodec>
+        <MediaCodec name="c2.floral.av1.encoder" type="video/av01">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="16-65536" />
+            <Limit name="blocks-per-second" range="16-3932160" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="bitrate-modes" value="VBR,CBR" />
+        </MediaCodec>
+        <MediaCodec name="c2.floral.mpeg2.encoder" type="video/mpeg2">
+            <Limit name="size" min="64x64" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="16-65536" />
+            <Limit name="blocks-per-second" range="16-3932160" />
+            <Limit name="bitrate" range="16000-200000000" />
+            <Feature name="bitrate-modes" value="VBR,CBR" />
+        </MediaCodec>
+    </Encoders>
+</MediaCodecs>

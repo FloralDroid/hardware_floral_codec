@@ -1,0 +1,7 @@
+service vendor.floral-codec /vendor/bin/hw/android.hardware.media.c2@1.2-service-floral
+    class hal
+    user mediacodec
+    group camera graphics media mediadrm drmrpc
+    capabilities SYS_NICE
+    ioprio rt 4
+    writepid /dev/cpuset/foreground/tasks

@@ -1,0 +1,86 @@
+package {
+    default_applicable_licenses: ["hardware_floral_codec_license"],
+}
+
+license {
+    name: "hardware_floral_codec_license",
+    visibility: [":__subpackages__"],
+    license_kinds: ["SPDX-license-identifier-Apache-2.0"],
+    license_text: ["LICENSE"],
+}
+
+cc_library_shared {
+    name: "libfloral_codec2",
+    vendor: true,
+    compile_multilib: "64",
+    defaults: ["libcodec2-impl-defaults"],
+    srcs: [
+        "src/CapabilityProbe.cpp",
+        "src/CodecSpec.cpp",
+        "src/FloralCodecComponent.cpp",
+        "src/FloralCodecStore.cpp",
+    ],
+    local_include_dirs: ["include"],
+    export_include_dirs: ["include"],
+    header_libs: [
+        "libfloral_va_headers",
+    ],
+    shared_libs: [
+        "libbase",
+        "libcodec2",
+        "libcodec2_soft_common",
+        "libcodec2_vndk",
+        "libfloral_ffmpeg_avcodec",
+        "libfloral_ffmpeg_avutil",
+        "libfloral_va_prebuilt",
+        "liblog",
+        "libstagefright_foundation",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wextra",
+    ],
+    cpp_std: "c++17",
+    target: {
+        android_x86_64: {
+            enabled: true,
+        },
+        android_x86: {
+            enabled: false,
+        },
+        android_arm: {
+            enabled: false,
+        },
+        android_arm64: {
+            enabled: false,
+        },
+    },
+}
+
+cc_binary {
+    name: "android.hardware.media.c2@1.2-service-floral",
+    vendor: true,
+    compile_multilib: "64",
+    relative_install_path: "hw",
+    defaults: [
+        "hidl_defaults",
+        "libcodec2-hidl-defaults",
+    ],
+    srcs: ["service/service.cpp"],
+    init_rc: ["service/android.hardware.media.c2@1.2-service-floral.rc"],
+    shared_libs: [
+        "libbinder",
+        "libfloral_codec2",
+        "libhidlbase",
+        "liblog",
+        "libutils",
+    ],
+}
+
+prebuilt_etc {
+    name: "floral_media_codecs_c2.xml",
+    vendor: true,
+    src: "config/media_codecs_c2.xml",
+    filename: "media_codecs_c2.xml",
+}
