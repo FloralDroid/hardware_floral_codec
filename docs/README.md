@@ -28,7 +28,7 @@ components.
 List registered codecs with:
 
 ```bash
-adb shell dumpsys media.codec | grep -F c2.floral
+adb shell dumpsys media.player | grep -F c2.floral
 ```
 
 Applications may request a component explicitly. For example, recent scrcpy

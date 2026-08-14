@@ -24,7 +24,7 @@ androidboot.floral_vaapi_device=/dev/dri/renderD129
 可使用以下命令列出已经注册的组件：
 
 ```bash
-adb shell dumpsys media.codec | grep -F c2.floral
+adb shell dumpsys media.player | grep -F c2.floral
 ```
 
 应用也可以明确指定组件。例如新版 scrcpy 可使用
