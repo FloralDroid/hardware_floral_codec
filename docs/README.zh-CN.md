@@ -1,5 +1,7 @@
 # Floral 硬件编解码器
 
+[English](README.md)
+
 `hardware_floral_codec` 提供由 FFmpeg 和 VA-API 驱动的非安全 Android Codec2
 组件。vendor component store 会在服务启动时探测当前 render node，仅发布 FFmpeg
 后端和 VA-API 驱动同时支持的编解码方向。

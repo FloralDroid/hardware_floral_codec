@@ -1,5 +1,7 @@
 # Floral hardware codecs
 
+[简体中文](README.zh-CN.md)
+
 `hardware_floral_codec` provides non-secure Android Codec2 components backed by
 FFmpeg and VA-API. The vendor component store probes the active render node at
 service startup and publishes only codec directions supported by both FFmpeg

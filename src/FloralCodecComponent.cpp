@@ -17,10 +17,12 @@
 #define LOG_TAG "FloralCodec2"
 
 #include "floral/codec/FloralCodecComponent.h"
+#include "floral/codec/VaapiFrameConverter.h"
 
 #include <C2PlatformSupport.h>
 #include <SimpleC2Component.h>
 #include <SimpleC2Interface.h>
+#include <android-C2Buffer.h>
 #include <hardware/gralloc.h>
 #include <log/log.h>
 
@@ -201,7 +203,8 @@ private:
   void AddEncoderParameters() {
     addParameter(DefineParam(mUsage, C2_PARAMKEY_INPUT_STREAM_USAGE)
                      .withConstValue(new C2StreamUsageTuning::input(
-                         0u, static_cast<uint64_t>(C2MemoryUsage::CPU_READ)))
+                         0u, static_cast<uint64_t>(
+                                 android::C2AndroidMemoryUsage::HW_CODEC_READ)))
                      .build());
     addParameter(
         DefineParam(mInputSize, C2_PARAMKEY_PICTURE_SIZE)
@@ -386,6 +389,7 @@ public:
   }
 
   void Close() {
+    frame_converter_.Reset();
     av_packet_free(&packet_);
     av_frame_free(&software_frame_);
     av_frame_free(&frame_);
@@ -403,24 +407,11 @@ public:
   void markConfigSent() { config_sent_ = true; }
   const CodecSpec &spec() const { return spec_; }
 
-  c2_status_t PrepareEncoderFrame(const C2GraphicView &view,
+  c2_status_t PrepareEncoderFrame(const C2ConstGraphicBlock &block,
                                   uint64_t frameIndex, bool requestSync) {
     if (context_ == nullptr || frames_context_ == nullptr) {
       return C2_NO_INIT;
     }
-    av_frame_unref(software_frame_);
-    software_frame_->format = AV_PIX_FMT_NV12;
-    software_frame_->width = context_->width;
-    software_frame_->height = context_->height;
-    int result = av_frame_get_buffer(software_frame_, 32);
-    if (result < 0) {
-      return Fail("allocating encoder staging frame", result);
-    }
-    result = CopyGraphicViewToNv12(view, software_frame_);
-    if (result != 0) {
-      return C2_BAD_VALUE;
-    }
-
     av_frame_unref(frame_);
     frame_->format = AV_PIX_FMT_VAAPI;
     frame_->width = context_->width;
@@ -429,13 +420,30 @@ public:
     if (frame_->hw_frames_ctx == nullptr) {
       return C2_NO_MEMORY;
     }
-    result = av_hwframe_get_buffer(frames_context_, frame_, 0);
+    int result = av_hwframe_get_buffer(frames_context_, frame_, 0);
     if (result < 0) {
       return Fail("allocating VA-API frame", result);
     }
-    result = av_hwframe_transfer_data(frame_, software_frame_, 0);
-    if (result < 0) {
-      return Fail("uploading VA-API frame", result);
+    const VaapiFrameConverter::Result conversion =
+        frame_converter_.Convert(block, frame_);
+    if (conversion == VaapiFrameConverter::Result::kError) {
+      // The destination surface may already contain submitted VPP work.
+      // Reusing it for a CPU upload would race with that operation.
+      return C2_CORRUPTED;
+    }
+    if (conversion == VaapiFrameConverter::Result::kUnsupported) {
+      const C2GraphicView view = block.map().get();
+      if (view.error() != C2_OK) {
+        return view.error();
+      }
+      result = PrepareSoftwareEncoderFrame(view);
+      if (result < 0) {
+        return Fail("preparing encoder staging frame", result);
+      }
+      result = av_hwframe_transfer_data(frame_, software_frame_, 0);
+      if (result < 0) {
+        return Fail("uploading VA-API frame", result);
+      }
     }
     frame_->pts = static_cast<int64_t>(frameIndex);
     if (requestSync) {
@@ -504,11 +512,33 @@ private:
     if (context_->hw_frames_ctx == nullptr) {
       return AVERROR(ENOMEM);
     }
-    // A depth of one keeps screen capture latency predictable across drivers.
+    if (!frame_converter_.Initialize(device_context_, context_->width,
+                                     context_->height)) {
+      ALOGW("VAAPI VideoProc import is unavailable; using CPU upload fallback");
+    }
+    // Keep several frames in flight without allowing an unbounded capture queue.
     if (context_->priv_data != nullptr) {
-      (void)av_opt_set_int(context_->priv_data, "async_depth", 1, 0);
+      (void)av_opt_set_int(context_->priv_data, "async_depth", 4, 0);
     }
     return 0;
+  }
+
+  int PrepareSoftwareEncoderFrame(const C2GraphicView &view) {
+    if (software_frame_->data[0] == nullptr) {
+      software_frame_->format = AV_PIX_FMT_NV12;
+      software_frame_->width = context_->width;
+      software_frame_->height = context_->height;
+      const int result = av_frame_get_buffer(software_frame_, 32);
+      if (result < 0) {
+        return result;
+      }
+    } else {
+      const int result = av_frame_make_writable(software_frame_);
+      if (result < 0) {
+        return result;
+      }
+    }
+    return CopyGraphicViewToNv12(view, software_frame_);
   }
 
   static int CopyGraphicViewToNv12(const C2GraphicView &view,
@@ -600,6 +630,7 @@ private:
   AVFrame *frame_ = nullptr;
   AVFrame *software_frame_ = nullptr;
   AVPacket *packet_ = nullptr;
+  VaapiFrameConverter frame_converter_;
   bool config_sent_ = false;
 };
 
@@ -732,16 +763,11 @@ private:
           input->data().graphicBlocks().empty()) {
         return C2_BAD_VALUE;
       }
-      const C2GraphicView view =
-          input->data().graphicBlocks().front().map().get();
-      if (view.error() != C2_OK) {
-        return view.error();
-      }
-
       const FloralCodecInterface::EncoderSettings settings =
           interface_->GetEncoderSettings();
       c2_status_t result = session_.PrepareEncoderFrame(
-          view, work->input.ordinal.frameIndex.peekull(),
+          input->data().graphicBlocks().front(),
+          work->input.ordinal.frameIndex.peekull(),
           settings.request_sync);
       if (result != C2_OK) {
         return result;
