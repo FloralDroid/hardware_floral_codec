@@ -359,6 +359,18 @@ private:
       }
       return Result::kError;
     }
+
+    // vaEndPicture is non-blocking. Complete the conversion before the input
+    // buffer can return to its producer and before the encoder reads output.
+    status = vaSyncSurface(display_, outputSurface);
+    if (status != VA_STATUS_SUCCESS) {
+      if (!conversion_error_logged_) {
+        ALOGE("waiting for VAAPI VideoProc output failed: %s",
+              vaErrorStr(status));
+        conversion_error_logged_ = true;
+      }
+      return Result::kError;
+    }
     return Result::kConverted;
   }
 

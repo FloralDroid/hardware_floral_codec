@@ -82,13 +82,20 @@ bool HasUsableConfiguration(VADisplay display, VAProfile profile,
 
 bool HasFfmpegCodec(const CodecSpec &spec) {
   if (spec.direction == CodecDirection::kEncode) {
-    return avcodec_find_encoder_by_name(spec.ffmpeg_name) != nullptr;
+    if (avcodec_find_encoder_by_name(spec.ffmpeg_name) == nullptr) {
+      ALOGW("%s: FFmpeg encoder %s is unavailable", spec.component_name,
+            spec.ffmpeg_name);
+      return false;
+    }
+    return true;
   }
   const AVCodec *decoder = avcodec_find_decoder_by_name(spec.ffmpeg_name);
   if (decoder == nullptr) {
     decoder = avcodec_find_decoder(static_cast<AVCodecID>(spec.codec_id));
   }
   if (decoder == nullptr) {
+    ALOGW("%s: FFmpeg decoder %s is unavailable", spec.component_name,
+          spec.ffmpeg_name);
     return false;
   }
   for (int index = 0;; ++index) {
@@ -101,6 +108,8 @@ bool HasFfmpegCodec(const CodecSpec &spec) {
       return true;
     }
   }
+  ALOGW("%s: FFmpeg decoder %s has no VAAPI hardware configuration",
+        spec.component_name, decoder->name);
   return false;
 }
 
@@ -146,12 +155,19 @@ bool CapabilityProbe::Supports(const CodecSpec &spec) const {
   if (!HasFfmpegCodec(spec)) {
     return false;
   }
-  return std::any_of(spec.va_profiles.begin(), spec.va_profiles.end(),
-                     [this, &spec](int profile) {
-                       return HasUsableConfiguration(
-                           impl_->display, static_cast<VAProfile>(profile),
-                           spec.direction);
-                     });
+  const bool supported =
+      std::any_of(spec.va_profiles.begin(), spec.va_profiles.end(),
+                  [this, &spec](int profile) {
+                    return HasUsableConfiguration(
+                        impl_->display, static_cast<VAProfile>(profile),
+                        spec.direction);
+                  });
+  if (!supported) {
+    ALOGW("%s: VAAPI exposes no usable %s YUV420 configuration",
+          spec.component_name,
+          spec.direction == CodecDirection::kDecode ? "VLD" : "encode");
+  }
+  return supported;
 }
 
 const std::string &CapabilityProbe::devicePath() const {
@@ -172,7 +188,7 @@ GetSupportedCodecSpecs(const CapabilityProbe &probe) {
       ALOGI("enabled %s on %s", spec.component_name,
             probe.devicePath().c_str());
     } else {
-      ALOGI("disabled unsupported component %s", spec.component_name);
+      ALOGV("disabled unsupported component %s", spec.component_name);
     }
   }
   return supported;

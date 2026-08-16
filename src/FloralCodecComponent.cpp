@@ -19,12 +19,14 @@
 #include "floral/codec/FloralCodecComponent.h"
 #include "floral/codec/VaapiFrameConverter.h"
 
+#include <C2Config.h>
 #include <C2PlatformSupport.h>
 #include <SimpleC2Component.h>
 #include <SimpleC2Interface.h>
 #include <android-C2Buffer.h>
 #include <hardware/gralloc.h>
 #include <log/log.h>
+#include <media/stagefright/foundation/MediaDefs.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -73,6 +75,7 @@ public:
     uint32_t width;
     uint32_t height;
     uint32_t bitrate;
+    C2Config::bitrate_mode_t bitrate_mode;
     float frame_rate;
     int64_t sync_interval_us;
     bool request_sync;
@@ -106,9 +109,10 @@ public:
   EncoderSettings GetEncoderSettings() const {
     Lock lock = this->lock();
     return EncoderSettings{
-        mInputSize->width,       mInputSize->height,
-        mBitrate->value,         mFrameRate->value,
-        mSyncFramePeriod->value, mRequestSync->value == C2_TRUE};
+        mInputSize->width,         mInputSize->height,
+        mBitrate->value,           mBitrateMode->value,
+        mFrameRate->value,         mSyncFramePeriod->value,
+        mRequestSync->value == C2_TRUE};
   }
 
   void ClearSyncRequest() {
@@ -293,13 +297,71 @@ private:
                      .withConstValue(new C2StreamPixelFormatInfo::output(
                          0u, HAL_PIXEL_FORMAT_YCBCR_420_888))
                      .build());
-    addParameter(DefineParam(mDecoderProfileLevel, C2_PARAMKEY_PROFILE_LEVEL)
-                     .withDefault(new C2StreamProfileLevelInfo::input(
-                         0u, C2Config::PROFILE_UNUSED, C2Config::LEVEL_UNUSED))
-                     .withFields({C2F(mDecoderProfileLevel, profile).any(),
-                                  C2F(mDecoderProfileLevel, level).any()})
-                     .withSetter(DecoderProfileLevelSetter)
-                     .build());
+    // Codec2InfoBuilder only publishes profiles when the fields enumerate
+    // supported values; advertising "any" makes AVC/HEVC disappear from
+    // profile-constrained MediaFormat checks.
+    if (std::strcmp(spec_.media_type, android::MEDIA_MIMETYPE_VIDEO_AVC) == 0) {
+      addParameter(
+          DefineParam(mDecoderProfileLevel, C2_PARAMKEY_PROFILE_LEVEL)
+              .withDefault(new C2StreamProfileLevelInfo::input(
+                  0u, C2Config::PROFILE_AVC_CONSTRAINED_BASELINE,
+                  C2Config::LEVEL_AVC_5_2))
+              .withFields(
+                  {C2F(mDecoderProfileLevel, profile)
+                       .oneOf({C2Config::PROFILE_AVC_CONSTRAINED_BASELINE,
+                               C2Config::PROFILE_AVC_BASELINE,
+                               C2Config::PROFILE_AVC_MAIN,
+                               C2Config::PROFILE_AVC_CONSTRAINED_HIGH,
+                               C2Config::PROFILE_AVC_PROGRESSIVE_HIGH,
+                               C2Config::PROFILE_AVC_HIGH}),
+                   C2F(mDecoderProfileLevel, level)
+                       .oneOf({C2Config::LEVEL_AVC_1, C2Config::LEVEL_AVC_1B,
+                               C2Config::LEVEL_AVC_1_1,
+                               C2Config::LEVEL_AVC_1_2,
+                               C2Config::LEVEL_AVC_1_3, C2Config::LEVEL_AVC_2,
+                               C2Config::LEVEL_AVC_2_1,
+                               C2Config::LEVEL_AVC_2_2, C2Config::LEVEL_AVC_3,
+                               C2Config::LEVEL_AVC_3_1,
+                               C2Config::LEVEL_AVC_3_2, C2Config::LEVEL_AVC_4,
+                               C2Config::LEVEL_AVC_4_1,
+                               C2Config::LEVEL_AVC_4_2, C2Config::LEVEL_AVC_5,
+                               C2Config::LEVEL_AVC_5_1,
+                               C2Config::LEVEL_AVC_5_2})})
+              .withSetter(DecoderProfileLevelSetter)
+              .build());
+    } else if (std::strcmp(spec_.media_type,
+                           android::MEDIA_MIMETYPE_VIDEO_HEVC) == 0) {
+      addParameter(
+          DefineParam(mDecoderProfileLevel, C2_PARAMKEY_PROFILE_LEVEL)
+              .withDefault(new C2StreamProfileLevelInfo::input(
+                  0u, C2Config::PROFILE_HEVC_MAIN,
+                  C2Config::LEVEL_HEVC_MAIN_5_2))
+              .withFields(
+                  {C2F(mDecoderProfileLevel, profile)
+                       .oneOf({C2Config::PROFILE_HEVC_MAIN}),
+                   C2F(mDecoderProfileLevel, level)
+                       .oneOf({C2Config::LEVEL_HEVC_MAIN_1,
+                               C2Config::LEVEL_HEVC_MAIN_2,
+                               C2Config::LEVEL_HEVC_MAIN_2_1,
+                               C2Config::LEVEL_HEVC_MAIN_3,
+                               C2Config::LEVEL_HEVC_MAIN_3_1,
+                               C2Config::LEVEL_HEVC_MAIN_4,
+                               C2Config::LEVEL_HEVC_MAIN_4_1,
+                               C2Config::LEVEL_HEVC_MAIN_5,
+                               C2Config::LEVEL_HEVC_MAIN_5_1,
+                               C2Config::LEVEL_HEVC_MAIN_5_2})})
+              .withSetter(DecoderProfileLevelSetter)
+              .build());
+    } else {
+      addParameter(DefineParam(mDecoderProfileLevel, C2_PARAMKEY_PROFILE_LEVEL)
+                       .withDefault(new C2StreamProfileLevelInfo::input(
+                           0u, C2Config::PROFILE_UNUSED,
+                           C2Config::LEVEL_UNUSED))
+                       .withFields({C2F(mDecoderProfileLevel, profile).any(),
+                                    C2F(mDecoderProfileLevel, level).any()})
+                       .withSetter(DecoderProfileLevelSetter)
+                       .build());
+    }
   }
 
   CodecSpec spec_;
@@ -486,7 +548,25 @@ private:
         AVRational{static_cast<int>(std::round(settings.frame_rate)), 1};
     context_->pix_fmt = AV_PIX_FMT_VAAPI;
     context_->bit_rate = settings.bitrate;
-    context_->rc_max_rate = settings.bitrate;
+    const bool constantBitrate =
+        settings.bitrate_mode == C2Config::BITRATE_CONST ||
+        settings.bitrate_mode == C2Config::BITRATE_CONST_SKIP_ALLOWED;
+    if (constantBitrate) {
+      if (context_->priv_data == nullptr) {
+        ALOGE("VAAPI encoder has no private rate control options");
+        return AVERROR(EINVAL);
+      }
+      const int rateControlResult =
+          av_opt_set(context_->priv_data, "rc_mode", "CBR", 0);
+      if (rateControlResult < 0) {
+        ALOGE("setting VAAPI CBR rate control failed: %s",
+              AvError(rateControlResult).c_str());
+        return rateControlResult;
+      }
+    }
+    // With no max rate, VAAPI auto selection prefers AVBR/VBR and can fall
+    // back to CBR on drivers that do not expose a variable-rate mode.
+    context_->rc_max_rate = constantBitrate ? settings.bitrate : 0;
     context_->rc_buffer_size = std::max<uint32_t>(settings.bitrate / 2, 1);
     context_->gop_size = std::max<int>(
         1, static_cast<int>(settings.frame_rate * settings.sync_interval_us /
@@ -775,8 +855,16 @@ private:
       if (settings.request_sync) {
         interface_->ClearSyncRequest();
       }
-      const int sendResult =
+      int sendResult =
           avcodec_send_frame(session_.context(), session_.frame());
+      if (sendResult == AVERROR(EAGAIN)) {
+        result = DrainEncoder(work.get(), pool, false);
+        if (result != C2_OK) {
+          return result;
+        }
+        sendResult =
+            avcodec_send_frame(session_.context(), session_.frame());
+      }
       if (sendResult < 0) {
         ALOGE("avcodec_send_frame failed: %s", AvError(sendResult).c_str());
         return C2_CORRUPTED;
@@ -917,7 +1005,14 @@ private:
       packet->pts =
           static_cast<int64_t>(work->input.ordinal.frameIndex.peekull());
       packet->dts = packet->pts;
-      const int sendResult = avcodec_send_packet(session_.context(), packet);
+      int sendResult = avcodec_send_packet(session_.context(), packet);
+      if (sendResult == AVERROR(EAGAIN)) {
+        c2_status_t result = DrainDecoder(work.get(), pool, false);
+        if (result != C2_OK) {
+          return result;
+        }
+        sendResult = avcodec_send_packet(session_.context(), packet);
+      }
       if (sendResult < 0) {
         ALOGE("avcodec_send_packet failed: %s", AvError(sendResult).c_str());
         return C2_CORRUPTED;
@@ -970,7 +1065,7 @@ private:
       const int receiveResult =
           avcodec_receive_frame(session_.context(), frame);
       if (receiveResult == AVERROR(EAGAIN) || receiveResult == AVERROR_EOF) {
-        return C2_OK;
+        break;
       }
       if (receiveResult < 0) {
         ALOGE("avcodec_receive_frame failed: %s",
