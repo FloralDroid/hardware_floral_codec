@@ -58,6 +58,12 @@ constexpr uint32_t kMaxPictureDimension = 4096;
 constexpr uint32_t kDefaultBitrate = 4'000'000;
 constexpr float kDefaultFrameRate = 30.0f;
 constexpr uint32_t kMinInputBufferSize = 2 * 1024 * 1024;
+constexpr uint32_t kDecoderOutputWidthAlignment = 32;
+
+constexpr uint32_t AlignDecoderOutputWidth(uint32_t width) {
+  return (width + kDecoderOutputWidthAlignment - 1) &
+         ~(kDecoderOutputWidthAlignment - 1);
+}
 
 uint8_t ClampByte(int value) {
   return static_cast<uint8_t>(std::clamp(value, 0, 255));
@@ -1254,9 +1260,12 @@ private:
       std::shared_ptr<C2GraphicBlock> block;
       const C2MemoryUsage usage = {C2MemoryUsage::CPU_READ,
                                    C2MemoryUsage::CPU_WRITE};
-      result = pool->fetchGraphicBlock(outputFrame->width, outputFrame->height,
-                                       HAL_PIXEL_FORMAT_YCBCR_420_888, usage,
-                                       &block);
+      // Keep the flexible YUV420 output declaration above, but use the
+      // concrete planar format supported by the GBM gralloc backend when
+      // allocating a CPU-mapped decoder block.
+      result = pool->fetchGraphicBlock(
+          AlignDecoderOutputWidth(static_cast<uint32_t>(outputFrame->width)),
+          outputFrame->height, HAL_PIXEL_FORMAT_YV12, usage, &block);
       if (result != C2_OK) {
         return result;
       }
