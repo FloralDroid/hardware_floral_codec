@@ -1271,12 +1271,9 @@ private:
       std::shared_ptr<C2GraphicBlock> block;
       const C2MemoryUsage usage = {C2MemoryUsage::CPU_READ,
                                    C2MemoryUsage::CPU_WRITE};
-      // Keep the flexible YUV420 output declaration above, but use the
-      // concrete planar format supported by the GBM gralloc backend when
-      // allocating a CPU-mapped decoder block.
       result = pool->fetchGraphicBlock(
           AlignDecoderOutputWidth(static_cast<uint32_t>(outputFrame->width)),
-          outputFrame->height, HAL_PIXEL_FORMAT_YV12, usage, &block);
+          outputFrame->height, HAL_PIXEL_FORMAT_YCBCR_420_888, usage, &block);
       if (result != C2_OK) {
         return result;
       }
