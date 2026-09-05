@@ -16,6 +16,7 @@ cc_library_shared {
     defaults: ["libcodec2-impl-defaults"],
     srcs: [
         "src/CapabilityProbe.cpp",
+        "src/BitstreamUtils.cpp",
         "src/CodecSpec.cpp",
         "src/FloralCodecComponent.cpp",
         "src/FloralCodecStore.cpp",
@@ -61,6 +62,23 @@ cc_library_shared {
             enabled: false,
         },
     },
+}
+
+cc_test_host {
+    name: "floral_codec_bitstream_tests_host",
+    srcs: [
+        "src/BitstreamUtils.cpp",
+        "tests/BitstreamUtilsTest.cpp",
+    ],
+    local_include_dirs: ["include"],
+    static_libs: ["libgtest", "libgtest_main"],
+    test_suites: ["general-tests"],
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wextra",
+    ],
+    cpp_std: "c++17",
 }
 
 cc_binary {

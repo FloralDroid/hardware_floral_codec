@@ -16,6 +16,7 @@
 
 #define LOG_TAG "FloralCodec2"
 
+#include "floral/codec/BitstreamUtils.h"
 #include "floral/codec/FloralCodecComponent.h"
 #include "floral/codec/VaapiFrameConverter.h"
 
@@ -43,6 +44,7 @@ extern "C" {
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -728,6 +730,7 @@ public:
   ~FloralCodecComponent() override { onRelease(); }
 
   c2_status_t onInit() override {
+    ClearDecoderConfig();
     signalled_error_ = false;
     signalled_eos_ = false;
     if (spec_.direction == CodecDirection::kEncode) {
@@ -740,6 +743,7 @@ public:
 
   c2_status_t onStop() override {
     session_.Close();
+    ClearDecoderConfig();
     signalled_error_ = false;
     signalled_eos_ = false;
     return C2_OK;
@@ -747,10 +751,18 @@ public:
 
   void onReset() override { (void)onStop(); }
 
-  void onRelease() override { session_.Close(); }
+  void onRelease() override {
+    session_.Close();
+    ClearDecoderConfig();
+  }
 
   c2_status_t onFlush_sm() override {
     session_.Flush();
+    if (!decoder_config_.empty()) {
+      // A Codec2 flush keeps the current stream alive. Re-send its parameter
+      // sets with the first access unit after the decoder state is flushed.
+      decoder_config_pending_ = true;
+    }
     signalled_error_ = false;
     signalled_eos_ = false;
     return C2_OK;
@@ -985,6 +997,41 @@ private:
   c2_status_t ProcessDecoder(const std::unique_ptr<C2Work> &work,
                              const std::shared_ptr<C2BlockPool> &pool,
                              bool eos) {
+    BitstreamCodec bitstreamCodec = BitstreamCodec::kAvc;
+    const bool normalizeBitstream = GetDecoderBitstreamCodec(&bitstreamCodec);
+    c2_status_t result = ProcessDecoderConfigUpdates(*work, bitstreamCodec,
+                                                     normalizeBitstream);
+    if (result != C2_OK) {
+      return result;
+    }
+
+    const bool codecConfig =
+        (work->input.flags & C2FrameData::FLAG_CODEC_CONFIG) != 0;
+    if (codecConfig && normalizeBitstream) {
+      if (!work->input.buffers.empty()) {
+        const std::shared_ptr<C2Buffer> &input = work->input.buffers.front();
+        if (input->data().type() != C2BufferData::LINEAR ||
+            input->data().linearBlocks().empty()) {
+          return C2_BAD_VALUE;
+        }
+        const C2ReadView view = input->data().linearBlocks().front().map().get();
+        if (view.error() != C2_OK) {
+          return view.error();
+        }
+        result = StoreDecoderConfig(bitstreamCodec, view.data(),
+                                    view.capacity());
+        if (result != C2_OK) {
+          return result;
+        }
+      }
+      FinishEmptyWork(work.get(), eos);
+      if (eos) {
+        signalled_eos_ = true;
+      }
+      return C2_OK;
+    }
+
+    bool submitted = false;
     if (!work->input.buffers.empty()) {
       const std::shared_ptr<C2Buffer> &input = work->input.buffers.front();
       if (input->data().type() != C2BufferData::LINEAR ||
@@ -995,32 +1042,80 @@ private:
       if (view.error() != C2_OK) {
         return view.error();
       }
-      AVPacket *packet = session_.packet();
-      av_packet_unref(packet);
-      const int allocationResult = av_new_packet(packet, view.capacity());
-      if (allocationResult < 0) {
-        return C2_NO_MEMORY;
-      }
-      std::memcpy(packet->data, view.data(), view.capacity());
-      packet->pts =
-          static_cast<int64_t>(work->input.ordinal.frameIndex.peekull());
-      packet->dts = packet->pts;
-      int sendResult = avcodec_send_packet(session_.context(), packet);
-      if (sendResult == AVERROR(EAGAIN)) {
-        c2_status_t result = DrainDecoder(work.get(), pool, false);
-        if (result != C2_OK) {
-          return result;
+
+      if (view.capacity() == 0) {
+        if (!eos) {
+          FinishEmptyWork(work.get(), false);
         }
-        sendResult = avcodec_send_packet(session_.context(), packet);
-      }
-      if (sendResult < 0) {
-        ALOGE("avcodec_send_packet failed: %s", AvError(sendResult).c_str());
-        return C2_CORRUPTED;
-      }
-      if (!eos) {
-        c2_status_t result = DrainDecoder(work.get(), pool, false);
-        if (result != C2_OK) {
-          return result;
+      } else {
+        std::vector<uint8_t> normalized;
+        const uint8_t preferredNalLengthSize = decoder_nal_length_size_;
+        uint8_t detectedNalLengthSize = preferredNalLengthSize;
+        if (normalizeBitstream &&
+            !NormalizeAccessUnit(bitstreamCodec, view.data(), view.capacity(),
+                                 preferredNalLengthSize, &normalized,
+                                 &detectedNalLengthSize)) {
+          ALOGE("failed to normalize %s decoder access unit",
+                bitstreamCodec == BitstreamCodec::kAvc ? "AVC" : "HEVC");
+          return C2_CORRUPTED;
+        }
+        if (normalizeBitstream) {
+          decoder_nal_length_size_ = detectedNalLengthSize;
+        } else {
+          normalized.assign(view.data(), view.data() + view.capacity());
+        }
+
+        std::vector<uint8_t> packetData;
+        if (normalizeBitstream && decoder_config_pending_ &&
+            !decoder_config_.empty()) {
+          if (decoder_config_.size() >
+              std::numeric_limits<size_t>::max() - normalized.size()) {
+            return C2_NO_MEMORY;
+          }
+          packetData.reserve(decoder_config_.size() + normalized.size());
+          packetData.insert(packetData.end(), decoder_config_.begin(),
+                            decoder_config_.end());
+          packetData.insert(packetData.end(), normalized.begin(),
+                            normalized.end());
+        } else {
+          packetData = std::move(normalized);
+        }
+        if (packetData.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+          return C2_BAD_VALUE;
+        }
+        AVPacket *packet = session_.packet();
+        av_packet_unref(packet);
+        const int allocationResult =
+            av_new_packet(packet, static_cast<int>(packetData.size()));
+        if (allocationResult < 0) {
+          return C2_NO_MEMORY;
+        }
+        std::memcpy(packet->data, packetData.data(), packetData.size());
+        packet->pts =
+            static_cast<int64_t>(work->input.ordinal.frameIndex.peekull());
+        packet->dts = packet->pts;
+        int sendResult = avcodec_send_packet(session_.context(), packet);
+        if (sendResult == AVERROR(EAGAIN)) {
+          result = DrainDecoder(work.get(), pool, false);
+          if (result != C2_OK) {
+            return result;
+          }
+          sendResult = avcodec_send_packet(session_.context(), packet);
+        }
+        if (sendResult < 0) {
+          ALOGE("avcodec_send_packet failed: %s", AvError(sendResult).c_str());
+          return C2_CORRUPTED;
+        }
+        submitted = true;
+        if (normalizeBitstream) {
+          decoder_config_pending_ = false;
+        }
+        if (!eos) {
+          result = DrainDecoder(work.get(), pool, false);
+          if (result != C2_OK) {
+            return result;
+          }
         }
       }
     }
@@ -1048,10 +1143,82 @@ private:
         FinishEmptyWork(work.get(), true);
       }
       signalled_eos_ = true;
-    } else if (work->input.buffers.empty()) {
+    } else if (!submitted) {
       FinishEmptyWork(work.get(), false);
     }
     return C2_OK;
+  }
+
+  bool GetDecoderBitstreamCodec(BitstreamCodec *codec) const {
+    if (codec == nullptr || spec_.direction != CodecDirection::kDecode) {
+      return false;
+    }
+    if (std::strcmp(spec_.media_type, android::MEDIA_MIMETYPE_VIDEO_AVC) ==
+        0) {
+      *codec = BitstreamCodec::kAvc;
+      return true;
+    }
+    if (std::strcmp(spec_.media_type, android::MEDIA_MIMETYPE_VIDEO_HEVC) ==
+        0) {
+      *codec = BitstreamCodec::kHevc;
+      return true;
+    }
+    return false;
+  }
+
+  c2_status_t StoreDecoderConfig(BitstreamCodec codec, const uint8_t *data,
+                                 size_t size) {
+    if (size == 0) {
+      return C2_OK;
+    }
+    std::vector<uint8_t> normalized;
+    uint8_t detectedNalLengthSize = decoder_nal_length_size_;
+    if (!NormalizeCodecConfig(codec, data, size, decoder_nal_length_size_,
+                              &normalized, &detectedNalLengthSize)) {
+      ALOGE("failed to normalize %s decoder codec config",
+            codec == BitstreamCodec::kAvc ? "AVC" : "HEVC");
+      return C2_CORRUPTED;
+    }
+    if (decoder_config_pending_) {
+      if (decoder_config_.size() >
+          std::numeric_limits<size_t>::max() - normalized.size()) {
+        return C2_NO_MEMORY;
+      }
+      decoder_config_.insert(decoder_config_.end(), normalized.begin(),
+                             normalized.end());
+    } else {
+      decoder_config_ = std::move(normalized);
+    }
+    decoder_nal_length_size_ = detectedNalLengthSize;
+    decoder_config_pending_ = true;
+    return C2_OK;
+  }
+
+  c2_status_t ProcessDecoderConfigUpdates(const C2Work &work,
+                                          BitstreamCodec codec,
+                                          bool normalizeBitstream) {
+    if (!normalizeBitstream) {
+      return C2_OK;
+    }
+    for (const std::unique_ptr<C2Param> &param : work.input.configUpdate) {
+      const C2StreamInitDataInfo::input *initData =
+          C2StreamInitDataInfo::input::From(param.get());
+      if (initData == nullptr) {
+        continue;
+      }
+      const c2_status_t result =
+          StoreDecoderConfig(codec, initData->m.value, initData->flexCount());
+      if (result != C2_OK) {
+        return result;
+      }
+    }
+    return C2_OK;
+  }
+
+  void ClearDecoderConfig() {
+    decoder_config_.clear();
+    decoder_config_pending_ = false;
+    decoder_nal_length_size_ = 4;
   }
 
   c2_status_t DrainDecoder(C2Work *currentWork,
@@ -1222,6 +1389,9 @@ private:
   CodecSpec spec_;
   std::shared_ptr<FloralCodecInterface> interface_;
   FfmpegSession session_;
+  std::vector<uint8_t> decoder_config_;
+  uint8_t decoder_nal_length_size_ = 4;
+  bool decoder_config_pending_ = false;
   bool signalled_error_ = false;
   bool signalled_eos_ = false;
 };
