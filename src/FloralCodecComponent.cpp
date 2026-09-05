@@ -55,6 +55,8 @@ namespace {
 constexpr uint32_t kDefaultWidth = 1280;
 constexpr uint32_t kDefaultHeight = 720;
 constexpr uint32_t kMaxPictureDimension = 4096;
+constexpr uint32_t kDefaultDecoderOutputDelay = 8;
+constexpr uint32_t kMaxDecoderOutputDelay = 34;
 constexpr uint32_t kDefaultBitrate = 4'000'000;
 constexpr float kDefaultFrameRate = 30.0f;
 constexpr uint32_t kMinInputBufferSize = 2 * 1024 * 1024;
@@ -277,6 +279,15 @@ private:
   }
 
   void AddDecoderParameters() {
+    addParameter(
+        DefineParam(mActualOutputDelay, C2_PARAMKEY_OUTPUT_DELAY)
+            .withDefault(new C2PortActualDelayTuning::output(
+                kDefaultDecoderOutputDelay))
+            .withFields({C2F(mActualOutputDelay, value)
+                             .inRange(0, kMaxDecoderOutputDelay)})
+            .withSetter(
+                android::Setter<decltype(*mActualOutputDelay)>::StrictValueWithNoDeps)
+            .build());
     addParameter(
         DefineParam(mOutputSize, C2_PARAMKEY_PICTURE_SIZE)
             .withDefault(new C2StreamPictureSizeInfo::output(0u, kDefaultWidth,
