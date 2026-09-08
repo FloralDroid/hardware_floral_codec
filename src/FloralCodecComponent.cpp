@@ -18,8 +18,11 @@
 
 #include "floral/codec/BitstreamUtils.h"
 #include "floral/codec/FloralCodecComponent.h"
+#include "floral/codec/MinigbmBuffer.h"
 #include "floral/codec/VaapiFrameConverter.h"
 
+#include <C2AllocatorGralloc.h>
+#include <C2BlockInternal.h>
 #include <C2Config.h>
 #include <C2PlatformSupport.h>
 #include <SimpleC2Component.h>
@@ -35,6 +38,7 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_vaapi.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
@@ -478,6 +482,7 @@ public:
     av_buffer_unref(&frames_context_);
     av_buffer_unref(&device_context_);
     config_sent_ = false;
+    zero_copy_error_logged_ = false;
   }
 
   AVCodecContext *context() const { return context_; }
@@ -544,6 +549,104 @@ public:
       return Fail("downloading VA-API frame", result);
     }
     *output = software_frame_;
+    return C2_OK;
+  }
+
+  c2_status_t CreateZeroCopyDecodedBlock(
+      std::shared_ptr<C2GraphicBlock> *block) {
+    if (block == nullptr || frame_->format != AV_PIX_FMT_VAAPI ||
+        device_context_ == nullptr) {
+      return C2_BAD_VALUE;
+    }
+    block->reset();
+
+    auto *device = reinterpret_cast<AVHWDeviceContext *>(device_context_->data);
+    if (device == nullptr || device->type != AV_HWDEVICE_TYPE_VAAPI ||
+        device->hwctx == nullptr) {
+      return C2_NO_INIT;
+    }
+    auto *vaapi = reinterpret_cast<AVVAAPIDeviceContext *>(device->hwctx);
+    const VASurfaceID surface =
+        static_cast<VASurfaceID>(reinterpret_cast<uintptr_t>(frame_->data[3]));
+    if (vaapi->display == nullptr || surface == VA_INVALID_SURFACE) {
+      return C2_BAD_VALUE;
+    }
+
+    VAStatus vaStatus = vaSyncSurface(vaapi->display, surface);
+    if (vaStatus != VA_STATUS_SUCCESS) {
+      LogZeroCopyFailure("synchronizing VAAPI decode surface", vaStatus);
+      return C2_CORRUPTED;
+    }
+
+    VADRMPRIMESurfaceDescriptor descriptor{};
+    constexpr uint32_t exportFlags = VA_EXPORT_SURFACE_READ_ONLY;
+    vaStatus = vaExportSurfaceHandle(
+        vaapi->display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+        exportFlags | VA_EXPORT_SURFACE_COMPOSED_LAYERS, &descriptor);
+    if (vaStatus != VA_STATUS_SUCCESS) {
+      // Some VA drivers only implement the older per-layer export. The
+      // minigbm adapter normalizes its R8 + GR88 layers back to NV12 planes.
+      descriptor = {};
+      vaStatus = vaExportSurfaceHandle(
+          vaapi->display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+          exportFlags | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &descriptor);
+    }
+    if (vaStatus != VA_STATUS_SUCCESS) {
+      LogZeroCopyFailure("exporting VAAPI decode surface", vaStatus);
+      return C2_OMITTED;
+    }
+
+    uint32_t pixelStride = 0;
+    native_handle_t *nativeHandle = CreateMinigbmHandle(
+        descriptor, static_cast<uint32_t>(frame_->width),
+        static_cast<uint32_t>(frame_->height), 0, &pixelStride);
+    CloseVaDescriptorFds(&descriptor);
+    if (nativeHandle == nullptr) {
+      LogZeroCopyFailure("creating minigbm handle", VA_STATUS_ERROR_OPERATION_FAILED);
+      return C2_OMITTED;
+    }
+
+    C2Handle *c2Handle = android::WrapNativeCodec2GrallocHandle(
+        nativeHandle, static_cast<uint32_t>(frame_->width),
+        static_cast<uint32_t>(frame_->height), HAL_PIXEL_FORMAT_YCBCR_420_888,
+        0, pixelStride);
+    native_handle_close(nativeHandle);
+    native_handle_delete(nativeHandle);
+    if (c2Handle == nullptr) {
+      return C2_NO_MEMORY;
+    }
+
+    std::shared_ptr<C2AllocatorStore> allocatorStore =
+        android::GetCodec2PlatformAllocatorStore();
+    std::shared_ptr<C2Allocator> allocator;
+    c2_status_t result = allocatorStore == nullptr
+                             ? C2_NO_INIT
+                             : allocatorStore->fetchAllocator(
+                                   android::C2PlatformAllocatorStore::GRALLOC,
+                                   &allocator);
+    if (result != C2_OK || allocator == nullptr) {
+      native_handle_close(c2Handle);
+      native_handle_delete(c2Handle);
+      return result == C2_OK ? C2_NO_INIT : result;
+    }
+
+    std::shared_ptr<C2GraphicAllocation> allocation;
+    result = allocator->priorGraphicAllocation(c2Handle, &allocation);
+    if (result != C2_OK || allocation == nullptr) {
+      native_handle_close(c2Handle);
+      native_handle_delete(c2Handle);
+      return result == C2_OK ? C2_CORRUPTED : result;
+    }
+    *block = _C2BlockFactory::CreateGraphicBlock(
+        allocation, nullptr,
+        C2Rect(static_cast<uint32_t>(frame_->width),
+               static_cast<uint32_t>(frame_->height)));
+    if (*block == nullptr) {
+      // The allocator took ownership of c2Handle. The allocation remains
+      // alive until this local reference is released.
+      return C2_NO_MEMORY;
+    }
+    // C2AllocatorGralloc keeps the imported native handle in its allocation.
     return C2_OK;
   }
 
@@ -721,6 +824,14 @@ private:
     return C2_CORRUPTED;
   }
 
+  void LogZeroCopyFailure(const char *operation, VAStatus status) {
+    if (!zero_copy_error_logged_) {
+      ALOGW("%s for %s failed: %s; falling back to CPU output copy", operation,
+            spec_.component_name, vaErrorStr(status));
+      zero_copy_error_logged_ = true;
+    }
+  }
+
   CodecSpec spec_;
   std::string device_path_;
   AVBufferRef *device_context_ = nullptr;
@@ -731,6 +842,7 @@ private:
   AVPacket *packet_ = nullptr;
   VaapiFrameConverter frame_converter_;
   bool config_sent_ = false;
+  bool zero_copy_error_logged_ = false;
 };
 
 class FloralCodecComponent : public android::SimpleC2Component {
@@ -1257,33 +1369,45 @@ private:
         return C2_CORRUPTED;
       }
 
-      AVFrame *outputFrame = nullptr;
-      c2_status_t result = session_.DownloadDecodedFrame(&outputFrame);
+      std::shared_ptr<C2GraphicBlock> block;
+      AVFrame *outputFrame = frame;
+      c2_status_t result = C2_OK;
+      if (frame->format == AV_PIX_FMT_VAAPI) {
+        result = session_.CreateZeroCopyDecodedBlock(&block);
+        if (result != C2_OK) {
+          // Export/import is an optional fast path. Keep the decoder usable
+          // with VA drivers that expose decode but not PRIME export/import.
+          result = session_.DownloadDecodedFrame(&outputFrame);
+        }
+      } else {
+        result = session_.DownloadDecodedFrame(&outputFrame);
+      }
       if (result != C2_OK) {
         return result;
-      }
-      if (outputFrame->format != AV_PIX_FMT_NV12 &&
-          outputFrame->format != AV_PIX_FMT_YUV420P) {
-        ALOGE("unsupported decoded pixel format %d", outputFrame->format);
-        return C2_BAD_VALUE;
       }
 
-      std::shared_ptr<C2GraphicBlock> block;
-      const C2MemoryUsage usage = {C2MemoryUsage::CPU_READ,
-                                   C2MemoryUsage::CPU_WRITE};
-      result = pool->fetchGraphicBlock(
-          AlignDecoderOutputWidth(static_cast<uint32_t>(outputFrame->width)),
-          outputFrame->height, HAL_PIXEL_FORMAT_YCBCR_420_888, usage, &block);
-      if (result != C2_OK) {
-        return result;
-      }
-      C2GraphicView view = block->map().get();
-      if (view.error() != C2_OK) {
-        return view.error();
-      }
-      result = CopyFrameToGraphicView(outputFrame, &view);
-      if (result != C2_OK) {
-        return result;
+      if (block == nullptr) {
+        if (outputFrame->format != AV_PIX_FMT_NV12 &&
+            outputFrame->format != AV_PIX_FMT_YUV420P) {
+          ALOGE("unsupported decoded pixel format %d", outputFrame->format);
+          return C2_BAD_VALUE;
+        }
+        const C2MemoryUsage usage = {C2MemoryUsage::CPU_READ,
+                                     C2MemoryUsage::CPU_WRITE};
+        result = pool->fetchGraphicBlock(
+            AlignDecoderOutputWidth(static_cast<uint32_t>(outputFrame->width)),
+            outputFrame->height, HAL_PIXEL_FORMAT_YCBCR_420_888, usage, &block);
+        if (result != C2_OK) {
+          return result;
+        }
+        C2GraphicView view = block->map().get();
+        if (view.error() != C2_OK) {
+          return view.error();
+        }
+        result = CopyFrameToGraphicView(outputFrame, &view);
+        if (result != C2_OK) {
+          return result;
+        }
       }
 
       std::vector<std::unique_ptr<C2Param>> updates;

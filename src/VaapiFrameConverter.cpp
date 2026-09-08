@@ -18,13 +18,10 @@
 
 #include "floral/codec/VaapiFrameConverter.h"
 
-#include "floral/display/GrallocMetadata.h"
+#include "floral/codec/MinigbmBuffer.h"
 
 #include <cutils/native_handle.h>
 #include <C2AllocatorGralloc.h>
-#include <drm_fourcc.h>
-#include <hardware/gralloc.h>
-#include <hardware/hardware.h>
 #include <log/log.h>
 #include <va/va.h>
 #include <va/va_drmcommon.h>
@@ -38,7 +35,6 @@ extern "C" {
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
-#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -59,60 +55,6 @@ struct NativeHandleDeleter {
 };
 
 using NativeHandle = std::unique_ptr<native_handle_t, NativeHandleDeleter>;
-
-uint32_t ToVaFourcc(uint32_t drmFormat) {
-  switch (drmFormat) {
-  case DRM_FORMAT_ABGR8888:
-    return VA_FOURCC_RGBA;
-  case DRM_FORMAT_XBGR8888:
-    return VA_FOURCC_RGBX;
-  case DRM_FORMAT_ARGB8888:
-    return VA_FOURCC_BGRA;
-  case DRM_FORMAT_XRGB8888:
-    return VA_FOURCC_BGRX;
-  default:
-    return 0;
-  }
-}
-
-bool FitsUint32(uint64_t value) {
-  return value <= std::numeric_limits<uint32_t>::max();
-}
-
-bool IsValidMetadata(const floral_gralloc_buffer_metadata_v1_t &metadata,
-                     const native_handle_t *handle, uint32_t width,
-                     uint32_t height) {
-  if (handle == nullptr || metadata.struct_size != sizeof(metadata) ||
-      metadata.version != FLORAL_GRALLOC_BUFFER_METADATA_VERSION_1 ||
-      (metadata.flags & FLORAL_GRALLOC_BUFFER_METADATA_FLAG_DRM_PRIME) == 0 ||
-      (metadata.flags & FLORAL_GRALLOC_BUFFER_METADATA_FLAG_PROTECTED) != 0 ||
-      metadata.width != width || metadata.height != height ||
-      metadata.layers != 1 || metadata.drm_format == 0 ||
-      metadata.drm_object_count == 0 ||
-      metadata.drm_object_count > FLORAL_GRALLOC_BUFFER_MAX_DRM_OBJECTS ||
-      metadata.drm_plane_count == 0 ||
-      metadata.drm_plane_count > FLORAL_GRALLOC_BUFFER_MAX_DRM_PLANES ||
-      ToVaFourcc(metadata.drm_format) == 0) {
-    return false;
-  }
-
-  for (uint32_t index = 0; index < metadata.drm_object_count; ++index) {
-    const auto &object = metadata.drm_objects[index];
-    if (object.fd_index >= static_cast<uint32_t>(handle->numFds) ||
-        object.size == 0 || !FitsUint32(object.size) ||
-        handle->data[object.fd_index] < 0) {
-      return false;
-    }
-  }
-  for (uint32_t index = 0; index < metadata.drm_plane_count; ++index) {
-    const auto &plane = metadata.drm_planes[index];
-    if (plane.object_index >= metadata.drm_object_count || plane.pitch == 0 ||
-        !FitsUint32(plane.offset) || !FitsUint32(plane.pitch)) {
-      return false;
-    }
-  }
-  return true;
-}
 
 } // namespace
 
@@ -140,14 +82,6 @@ public:
     display_ = vaapi->display;
     width_ = width;
     height_ = height;
-    const hw_module_t *module = nullptr;
-    if (hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &module) != 0 ||
-        module == nullptr) {
-      Reset();
-      return false;
-    }
-    gralloc_module_ = reinterpret_cast<const gralloc_module_t *>(module);
-
     VAStatus status = vaCreateConfig(display_, VAProfileNone,
                                      VAEntrypointVideoProc, nullptr, 0,
                                      &vpp_config_);
@@ -167,8 +101,7 @@ public:
   }
 
   Result Convert(const C2ConstGraphicBlock &block, AVFrame *destination) {
-    if (display_ == nullptr || gralloc_module_ == nullptr ||
-        gralloc_module_->perform == nullptr || destination == nullptr ||
+    if (display_ == nullptr || destination == nullptr ||
         destination->format != AV_PIX_FMT_VAAPI) {
       return Result::kUnsupported;
     }
@@ -179,24 +112,21 @@ public:
       return Result::kUnsupported;
     }
 
-    floral_gralloc_buffer_metadata_v1_t metadata{};
-    metadata.struct_size = sizeof(metadata);
-    metadata.version = FLORAL_GRALLOC_BUFFER_METADATA_VERSION_1;
-    if (gralloc_module_->perform(
-            gralloc_module_,
-            FLORAL_GRALLOC_MODULE_PERFORM_GET_BUFFER_METADATA, handle.get(),
-            &metadata) != 0 ||
-        !IsValidMetadata(metadata, handle.get(), width_, height_)) {
+    VADRMPRIMESurfaceDescriptor descriptor{};
+    uint32_t vaFourcc = 0;
+    uint64_t bufferId = 0;
+    if (!GetMinigbmVaDescriptor(handle.get(), width_, height_, &descriptor,
+                                &vaFourcc, &bufferId)) {
       return Result::kUnsupported;
     }
 
-    VASurfaceID inputSurface = FindSurface(metadata.buffer_id);
+    VASurfaceID inputSurface = FindSurface(bufferId);
     if (inputSurface == VA_INVALID_SURFACE) {
-      inputSurface = ImportSurface(metadata, handle.get());
+      inputSurface = ImportSurface(descriptor, vaFourcc);
       if (inputSurface == VA_INVALID_SURFACE) {
         return Result::kUnsupported;
       }
-      CacheSurface(metadata.buffer_id, inputSurface);
+      CacheSurface(bufferId, inputSurface);
     }
 
     const VASurfaceID outputSurface = static_cast<VASurfaceID>(
@@ -220,7 +150,6 @@ public:
       }
     }
     surfaces_.clear();
-    gralloc_module_ = nullptr;
     display_ = nullptr;
     vpp_config_ = VA_INVALID_ID;
     vpp_context_ = VA_INVALID_ID;
@@ -256,31 +185,8 @@ private:
     surfaces_.push_back({bufferId, surface});
   }
 
-  VASurfaceID ImportSurface(
-      const floral_gralloc_buffer_metadata_v1_t &metadata,
-      const native_handle_t *handle) const {
-    VADRMPRIMESurfaceDescriptor descriptor{};
-    descriptor.fourcc = ToVaFourcc(metadata.drm_format);
-    descriptor.width = metadata.width;
-    descriptor.height = metadata.height;
-    descriptor.num_objects = metadata.drm_object_count;
-    descriptor.num_layers = 1;
-    descriptor.layers[0].drm_format = metadata.drm_format;
-    descriptor.layers[0].num_planes = metadata.drm_plane_count;
-
-    for (uint32_t index = 0; index < metadata.drm_object_count; ++index) {
-      const auto &object = metadata.drm_objects[index];
-      descriptor.objects[index].fd = handle->data[object.fd_index];
-      descriptor.objects[index].size = static_cast<uint32_t>(object.size);
-      descriptor.objects[index].drm_format_modifier = object.modifier;
-    }
-    for (uint32_t index = 0; index < metadata.drm_plane_count; ++index) {
-      const auto &plane = metadata.drm_planes[index];
-      descriptor.layers[0].object_index[index] = plane.object_index;
-      descriptor.layers[0].offset[index] = static_cast<uint32_t>(plane.offset);
-      descriptor.layers[0].pitch[index] = static_cast<uint32_t>(plane.pitch);
-    }
-
+  VASurfaceID ImportSurface(const VADRMPRIMESurfaceDescriptor &descriptor,
+                            uint32_t vaFourcc) const {
     VASurfaceAttrib attributes[3]{};
     attributes[0].type = VASurfaceAttribMemoryType;
     attributes[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
@@ -293,7 +199,7 @@ private:
     attributes[2].type = VASurfaceAttribPixelFormat;
     attributes[2].flags = VA_SURFACE_ATTRIB_SETTABLE;
     attributes[2].value.type = VAGenericValueTypeInteger;
-    attributes[2].value.value.i = descriptor.fourcc;
+    attributes[2].value.value.i = vaFourcc;
 
     VASurfaceID surface = VA_INVALID_SURFACE;
     const VAStatus status =
@@ -374,7 +280,6 @@ private:
     return Result::kConverted;
   }
 
-  const gralloc_module_t *gralloc_module_ = nullptr;
   VADisplay display_ = nullptr;
   VAConfigID vpp_config_ = VA_INVALID_ID;
   VAContextID vpp_context_ = VA_INVALID_ID;
