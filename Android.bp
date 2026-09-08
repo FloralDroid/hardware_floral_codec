@@ -43,6 +43,7 @@ cc_library_shared {
         "libhardware",
         "liblog",
         "libstagefright_foundation",
+        "android.hardware.graphics.bufferqueue@2.0",
     ],
     cflags: [
         "-Wall",

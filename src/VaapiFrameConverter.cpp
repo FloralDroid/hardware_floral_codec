@@ -195,7 +195,8 @@ private:
     attributes[1].type = VASurfaceAttribExternalBufferDescriptor;
     attributes[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
     attributes[1].value.type = VAGenericValueTypePointer;
-    attributes[1].value.value.p = &descriptor;
+    attributes[1].value.value.p =
+        const_cast<void *>(static_cast<const void *>(&descriptor));
     attributes[2].type = VASurfaceAttribPixelFormat;
     attributes[2].flags = VA_SURFACE_ATTRIB_SETTABLE;
     attributes[2].value.type = VAGenericValueTypeInteger;
