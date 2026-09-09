@@ -532,6 +532,7 @@ public:
       context_->get_format = SelectHardwareFormat;
       context_->get_buffer2 = GetDecoderBuffer;
       context_->pkt_timebase = AVRational{1, 1'000'000};
+      context_->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
     }
 
     result = avcodec_open2(context_, codec, nullptr);
@@ -1572,9 +1573,18 @@ private:
           return C2_NO_MEMORY;
         }
         std::memcpy(packet->data, packetData.data(), packetData.size());
-        packet->pts =
-            static_cast<int64_t>(work->input.ordinal.frameIndex.peekull());
-        packet->dts = packet->pts;
+        const uint64_t frameIndex =
+            work->input.ordinal.frameIndex.peekull();
+        packet->opaque_ref = av_buffer_alloc(sizeof(frameIndex));
+        if (packet->opaque_ref == nullptr) {
+          return C2_NO_MEMORY;
+        }
+        std::memcpy(packet->opaque_ref->data, &frameIndex,
+                    sizeof(frameIndex));
+        // Keep PTS as a compatibility fallback, but do not let FFmpeg replace
+        // a reordered frame's identity with the current packet DTS.
+        packet->pts = static_cast<int64_t>(frameIndex);
+        packet->dts = AV_NOPTS_VALUE;
         int sendResult = avcodec_send_packet(session_.context(), packet);
         if (sendResult == AVERROR(EAGAIN)) {
           result = DrainDecoder(work.get(), pool, false);
@@ -1771,16 +1781,16 @@ private:
       std::shared_ptr<C2Buffer> buffer =
           C2Buffer::CreateGraphicBuffer(block->share(
               C2Rect(outputFrame->width, outputFrame->height), C2Fence()));
-      const int64_t timestamp =
-          outputFrame->best_effort_timestamp != AV_NOPTS_VALUE
-              ? outputFrame->best_effort_timestamp
-              : outputFrame->pts;
-      const uint64_t frameIndex =
-          timestamp == AV_NOPTS_VALUE
-              ? (currentWork == nullptr
-                     ? 0
-                     : currentWork->input.ordinal.frameIndex.peekull())
-              : static_cast<uint64_t>(timestamp);
+      uint64_t frameIndex = 0;
+      if (frame->opaque_ref != nullptr &&
+          frame->opaque_ref->size >= sizeof(frameIndex)) {
+        std::memcpy(&frameIndex, frame->opaque_ref->data,
+                    sizeof(frameIndex));
+      } else if (frame->pts != AV_NOPTS_VALUE) {
+        frameIndex = static_cast<uint64_t>(frame->pts);
+      } else if (currentWork != nullptr) {
+        frameIndex = currentWork->input.ordinal.frameIndex.peekull();
+      }
       if (hasPending) {
         FinishOutput(pending.frame_index, currentWork, pending.buffer,
                      std::move(pending.updates), C2FrameData::flags_t(0));
