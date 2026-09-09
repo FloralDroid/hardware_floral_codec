@@ -65,6 +65,8 @@ namespace {
 constexpr uint32_t kDefaultWidth = 1280;
 constexpr uint32_t kDefaultHeight = 720;
 constexpr uint32_t kMaxPictureDimension = 4096;
+constexpr uint32_t kMinEncoderWidth = 256;
+constexpr uint32_t kMinEncoderHeight = 128;
 constexpr uint32_t kMaxHardwareReferenceFrames = 16;
 constexpr uint32_t kOutputConsumerSlack = 8;
 constexpr uint32_t kDefaultDecoderOutputDelay =
@@ -237,9 +239,10 @@ private:
         DefineParam(mInputSize, C2_PARAMKEY_PICTURE_SIZE)
             .withDefault(new C2StreamPictureSizeInfo::input(0u, kDefaultWidth,
                                                             kDefaultHeight))
-            .withFields(
-                {C2F(mInputSize, width).inRange(64, spec_.max_width, 2),
-                 C2F(mInputSize, height).inRange(64, spec_.max_height, 2)})
+            .withFields({C2F(mInputSize, width)
+                             .inRange(kMinEncoderWidth, spec_.max_width, 2),
+                         C2F(mInputSize, height)
+                             .inRange(kMinEncoderHeight, spec_.max_height, 2)})
             .withSetter(EncoderSizeSetter)
             .build());
     addParameter(
@@ -282,13 +285,68 @@ private:
             .withSetter(android::Setter<
                         decltype(*mSyncFramePeriod)>::StrictValueWithNoDeps)
             .build());
-    addParameter(DefineParam(mEncoderProfileLevel, C2_PARAMKEY_PROFILE_LEVEL)
-                     .withDefault(new C2StreamProfileLevelInfo::output(
-                         0u, C2Config::PROFILE_UNUSED, C2Config::LEVEL_UNUSED))
-                     .withFields({C2F(mEncoderProfileLevel, profile).any(),
-                                  C2F(mEncoderProfileLevel, level).any()})
-                     .withSetter(EncoderProfileLevelSetter)
-                     .build());
+    // Codec2InfoBuilder derives MediaCodecInfo profile limits from enumerated
+    // values. Leaving these fields as "any" makes Android apply AVC level 1
+    // defaults and reject otherwise valid capture sizes.
+    if (std::strcmp(spec_.media_type, android::MEDIA_MIMETYPE_VIDEO_AVC) == 0) {
+      addParameter(
+          DefineParam(mEncoderProfileLevel, C2_PARAMKEY_PROFILE_LEVEL)
+              .withDefault(new C2StreamProfileLevelInfo::output(
+                  0u, C2Config::PROFILE_AVC_HIGH, C2Config::LEVEL_AVC_5_2))
+              .withFields(
+                  {C2F(mEncoderProfileLevel, profile)
+                       .oneOf({C2Config::PROFILE_AVC_CONSTRAINED_BASELINE,
+                               C2Config::PROFILE_AVC_BASELINE,
+                               C2Config::PROFILE_AVC_MAIN,
+                               C2Config::PROFILE_AVC_HIGH}),
+                   C2F(mEncoderProfileLevel, level)
+                       .oneOf({C2Config::LEVEL_AVC_1, C2Config::LEVEL_AVC_1B,
+                               C2Config::LEVEL_AVC_1_1,
+                               C2Config::LEVEL_AVC_1_2,
+                               C2Config::LEVEL_AVC_1_3, C2Config::LEVEL_AVC_2,
+                               C2Config::LEVEL_AVC_2_1,
+                               C2Config::LEVEL_AVC_2_2, C2Config::LEVEL_AVC_3,
+                               C2Config::LEVEL_AVC_3_1,
+                               C2Config::LEVEL_AVC_3_2, C2Config::LEVEL_AVC_4,
+                               C2Config::LEVEL_AVC_4_1,
+                               C2Config::LEVEL_AVC_4_2, C2Config::LEVEL_AVC_5,
+                               C2Config::LEVEL_AVC_5_1,
+                               C2Config::LEVEL_AVC_5_2})})
+              .withSetter(EncoderProfileLevelSetter)
+              .build());
+    } else if (std::strcmp(spec_.media_type,
+                           android::MEDIA_MIMETYPE_VIDEO_HEVC) == 0) {
+      addParameter(
+          DefineParam(mEncoderProfileLevel, C2_PARAMKEY_PROFILE_LEVEL)
+              .withDefault(new C2StreamProfileLevelInfo::output(
+                  0u, C2Config::PROFILE_HEVC_MAIN,
+                  C2Config::LEVEL_HEVC_MAIN_5_2))
+              .withFields(
+                  {C2F(mEncoderProfileLevel, profile)
+                       .oneOf({C2Config::PROFILE_HEVC_MAIN}),
+                   C2F(mEncoderProfileLevel, level)
+                       .oneOf({C2Config::LEVEL_HEVC_MAIN_1,
+                               C2Config::LEVEL_HEVC_MAIN_2,
+                               C2Config::LEVEL_HEVC_MAIN_2_1,
+                               C2Config::LEVEL_HEVC_MAIN_3,
+                               C2Config::LEVEL_HEVC_MAIN_3_1,
+                               C2Config::LEVEL_HEVC_MAIN_4,
+                               C2Config::LEVEL_HEVC_MAIN_4_1,
+                               C2Config::LEVEL_HEVC_MAIN_5,
+                               C2Config::LEVEL_HEVC_MAIN_5_1,
+                               C2Config::LEVEL_HEVC_MAIN_5_2})})
+              .withSetter(EncoderProfileLevelSetter)
+              .build());
+    } else {
+      addParameter(DefineParam(mEncoderProfileLevel, C2_PARAMKEY_PROFILE_LEVEL)
+                       .withDefault(new C2StreamProfileLevelInfo::output(
+                           0u, C2Config::PROFILE_UNUSED,
+                           C2Config::LEVEL_UNUSED))
+                       .withFields({C2F(mEncoderProfileLevel, profile).any(),
+                                    C2F(mEncoderProfileLevel, level).any()})
+                       .withSetter(EncoderProfileLevelSetter)
+                       .build());
+    }
   }
 
   void AddDecoderParameters() {
