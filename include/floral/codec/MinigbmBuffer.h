@@ -30,12 +30,4 @@ bool GetMinigbmVaDescriptor(const native_handle_t *handle, uint32_t width,
                             VADRMPRIMESurfaceDescriptor *descriptor,
                             uint32_t *vaFourcc, uint64_t *bufferId);
 
-// Creates a minigbm-native handle from a VA-API export. The descriptor's file
-// descriptors remain owned by the caller; the returned handle contains dups.
-native_handle_t *CreateMinigbmHandle(
-    const VADRMPRIMESurfaceDescriptor &descriptor, uint32_t width,
-    uint32_t height, uint64_t usage, uint32_t *pixelStride);
-
-void CloseVaDescriptorFds(VADRMPRIMESurfaceDescriptor *descriptor);
-
 }  // namespace floral::codec

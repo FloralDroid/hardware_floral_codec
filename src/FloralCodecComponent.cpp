@@ -22,19 +22,21 @@
 #include "floral/codec/VaapiFrameConverter.h"
 
 #include <C2AllocatorGralloc.h>
-#include <C2BlockInternal.h>
 #include <C2Config.h>
 #include <C2PlatformSupport.h>
 #include <SimpleC2Component.h>
 #include <SimpleC2Interface.h>
 #include <android-C2Buffer.h>
+#include <cutils/native_handle.h>
 #include <hardware/gralloc.h>
+#include <hardware/gralloc1.h>
 #include <log/log.h>
 #include <media/stagefright/foundation/MediaDefs.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
+#include <libavutil/buffer.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
@@ -48,8 +50,12 @@ extern "C" {
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <new>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -59,7 +65,10 @@ namespace {
 constexpr uint32_t kDefaultWidth = 1280;
 constexpr uint32_t kDefaultHeight = 720;
 constexpr uint32_t kMaxPictureDimension = 4096;
-constexpr uint32_t kDefaultDecoderOutputDelay = 8;
+constexpr uint32_t kMaxHardwareReferenceFrames = 16;
+constexpr uint32_t kOutputConsumerSlack = 8;
+constexpr uint32_t kDefaultDecoderOutputDelay =
+    kMaxHardwareReferenceFrames + kOutputConsumerSlack;
 constexpr uint32_t kMaxDecoderOutputDelay = 34;
 constexpr uint32_t kDefaultBitrate = 4'000'000;
 constexpr float kDefaultFrameRate = 30.0f;
@@ -103,7 +112,6 @@ public:
         spec_(spec) {
     noPrivateBuffers();
     noInputReferences();
-    noOutputReferences();
     noInputLatency();
     noTimeStretch();
     setDerivedInstance(this);
@@ -114,6 +122,7 @@ public:
                      .build());
 
     if (spec.direction == CodecDirection::kEncode) {
+      noOutputReferences();
       AddEncoderParameters();
     } else {
       AddDecoderParameters();
@@ -284,6 +293,18 @@ private:
 
   void AddDecoderParameters() {
     addParameter(
+        DefineParam(mMaxOutputReferenceAge,
+                    C2_PARAMKEY_OUTPUT_MAX_REFERENCE_AGE)
+            .withConstValue(new C2StreamMaxReferenceAgeTuning::output(
+                0u, std::numeric_limits<uint32_t>::max()))
+            .build());
+    addParameter(
+        DefineParam(mMaxOutputReferenceCount,
+                    C2_PARAMKEY_OUTPUT_MAX_REFERENCE_COUNT)
+            .withConstValue(new C2StreamMaxReferenceCountTuning::output(
+                0u, kMaxHardwareReferenceFrames))
+            .build());
+    addParameter(
         DefineParam(mActualOutputDelay, C2_PARAMKEY_OUTPUT_DELAY)
             .withDefault(new C2PortActualDelayTuning::output(
                 kDefaultDecoderOutputDelay))
@@ -451,6 +472,7 @@ public:
       }
     } else {
       context_->get_format = SelectHardwareFormat;
+      context_->get_buffer2 = GetDecoderBuffer;
       context_->pkt_timebase = AVRational{1, 1'000'000};
     }
 
@@ -467,6 +489,12 @@ public:
   }
 
   void Flush() {
+    if (frame_ != nullptr) {
+      av_frame_unref(frame_);
+    }
+    if (software_frame_ != nullptr) {
+      av_frame_unref(software_frame_);
+    }
     if (context_ != nullptr) {
       avcodec_flush_buffers(context_);
     }
@@ -479,10 +507,11 @@ public:
     av_frame_free(&software_frame_);
     av_frame_free(&frame_);
     avcodec_free_context(&context_);
+    ResetDecoderOutputState();
     av_buffer_unref(&frames_context_);
     av_buffer_unref(&device_context_);
     config_sent_ = false;
-    zero_copy_error_logged_ = false;
+    direct_output_error_logged_ = false;
   }
 
   AVCodecContext *context() const { return context_; }
@@ -492,6 +521,16 @@ public:
   bool configSent() const { return config_sent_; }
   void markConfigSent() { config_sent_ = true; }
   const CodecSpec &spec() const { return spec_; }
+
+  void SetDecoderBlockPool(const std::shared_ptr<C2BlockPool> &pool) {
+    std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
+    if (decoder_block_pool_.get() != pool.get()) {
+      decoder_pending_blocks_.clear();
+      decoder_block_pool_ = pool;
+      direct_output_disabled_ = false;
+      direct_output_error_logged_ = false;
+    }
+  }
 
   c2_status_t PrepareEncoderFrame(const C2ConstGraphicBlock &block,
                                   uint64_t frameIndex, bool requestSync) {
@@ -552,8 +591,7 @@ public:
     return C2_OK;
   }
 
-  c2_status_t CreateZeroCopyDecodedBlock(
-      std::shared_ptr<C2GraphicBlock> *block) {
+  c2_status_t GetDirectDecodedBlock(std::shared_ptr<C2GraphicBlock> *block) {
     if (block == nullptr || frame_->format != AV_PIX_FMT_VAAPI ||
         device_context_ == nullptr) {
       return C2_BAD_VALUE;
@@ -572,94 +610,348 @@ public:
       return C2_BAD_VALUE;
     }
 
-    VAStatus vaStatus = vaSyncSurface(vaapi->display, surface);
+    {
+      std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
+      const auto found = decoder_surfaces_.find(surface);
+      if (found == decoder_surfaces_.end()) {
+        return C2_OMITTED;
+      }
+      *block = found->second->block;
+    }
+
+    // Codec2 has no VA-API fence representation. Complete decode writes before
+    // handing the BufferQueue slot to SurfaceFlinger.
+    const VAStatus vaStatus = vaSyncSurface(vaapi->display, surface);
     if (vaStatus != VA_STATUS_SUCCESS) {
-      LogZeroCopyFailure("synchronizing VAAPI decode surface", vaStatus);
+      DisableDirectOutputForVa("synchronizing direct VAAPI output", vaStatus);
+      block->reset();
       return C2_CORRUPTED;
     }
-
-    VADRMPRIMESurfaceDescriptor descriptor{};
-    constexpr uint32_t exportFlags = VA_EXPORT_SURFACE_READ_ONLY;
-    vaStatus = vaExportSurfaceHandle(
-        vaapi->display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-        exportFlags | VA_EXPORT_SURFACE_COMPOSED_LAYERS, &descriptor);
-    if (vaStatus != VA_STATUS_SUCCESS) {
-      // Some VA drivers only implement the older per-layer export. The
-      // minigbm adapter normalizes its R8 + GR88 layers back to NV12 planes.
-      descriptor = {};
-      vaStatus = vaExportSurfaceHandle(
-          vaapi->display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-          exportFlags | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &descriptor);
-    }
-    if (vaStatus != VA_STATUS_SUCCESS) {
-      LogZeroCopyFailure("exporting VAAPI decode surface", vaStatus);
-      return C2_OMITTED;
-    }
-
-    uint32_t pixelStride = 0;
-    native_handle_t *nativeHandle = CreateMinigbmHandle(
-        descriptor, static_cast<uint32_t>(frame_->width),
-        static_cast<uint32_t>(frame_->height), 0, &pixelStride);
-    CloseVaDescriptorFds(&descriptor);
-    if (nativeHandle == nullptr) {
-      LogZeroCopyFailure("creating minigbm handle", VA_STATUS_ERROR_OPERATION_FAILED);
-      return C2_OMITTED;
-    }
-
-    C2Handle *c2Handle = android::WrapNativeCodec2GrallocHandle(
-        nativeHandle, static_cast<uint32_t>(frame_->width),
-        static_cast<uint32_t>(frame_->height), HAL_PIXEL_FORMAT_YCBCR_420_888,
-        0, pixelStride);
-    native_handle_close(nativeHandle);
-    native_handle_delete(nativeHandle);
-    if (c2Handle == nullptr) {
-      return C2_NO_MEMORY;
-    }
-
-    std::shared_ptr<C2AllocatorStore> allocatorStore =
-        android::GetCodec2PlatformAllocatorStore();
-    std::shared_ptr<C2Allocator> allocator;
-    c2_status_t result = allocatorStore == nullptr
-                             ? C2_NO_INIT
-                             : allocatorStore->fetchAllocator(
-                                   android::C2PlatformAllocatorStore::GRALLOC,
-                                   &allocator);
-    if (result != C2_OK || allocator == nullptr) {
-      native_handle_close(c2Handle);
-      native_handle_delete(c2Handle);
-      return result == C2_OK ? C2_NO_INIT : result;
-    }
-
-    std::shared_ptr<C2GraphicAllocation> allocation;
-    result = allocator->priorGraphicAllocation(c2Handle, &allocation);
-    if (result != C2_OK || allocation == nullptr) {
-      native_handle_close(c2Handle);
-      native_handle_delete(c2Handle);
-      return result == C2_OK ? C2_CORRUPTED : result;
-    }
-    *block = _C2BlockFactory::CreateGraphicBlock(
-        allocation, nullptr,
-        C2Rect(static_cast<uint32_t>(frame_->width),
-               static_cast<uint32_t>(frame_->height)));
-    if (*block == nullptr) {
-      // The allocator took ownership of c2Handle. The allocation remains
-      // alive until this local reference is released.
-      return C2_NO_MEMORY;
-    }
-    // C2AllocatorGralloc keeps the imported native handle in its allocation.
     return C2_OK;
   }
 
 private:
-  static AVPixelFormat SelectHardwareFormat(AVCodecContext *,
+  struct DecoderBlock {
+    std::shared_ptr<C2GraphicBlock> block;
+    VADRMPRIMESurfaceDescriptor descriptor{};
+    uint32_t va_fourcc = 0;
+    uint64_t buffer_id = 0;
+  };
+
+  struct DecoderSurfaceReference {
+    FfmpegSession *owner = nullptr;
+    uint64_t buffer_id = 0;
+    VASurfaceID surface = VA_INVALID_SURFACE;
+    std::shared_ptr<C2GraphicBlock> block;
+  };
+
+  struct NativeHandleDeleter {
+    void operator()(native_handle_t *handle) const {
+      // UnwrapNativeCodec2GrallocHandle returns a non-owning handle whose fds
+      // remain owned by the C2 block.
+      if (handle != nullptr) {
+        native_handle_delete(handle);
+      }
+    }
+  };
+
+  using NativeHandle = std::unique_ptr<native_handle_t, NativeHandleDeleter>;
+
+  static AVPixelFormat SelectHardwareFormat(AVCodecContext *context,
                                             const AVPixelFormat *formats) {
     for (const AVPixelFormat *format = formats; *format != AV_PIX_FMT_NONE;
          ++format) {
       if (*format == AV_PIX_FMT_VAAPI) {
+        auto *session = static_cast<FfmpegSession *>(context->opaque);
+        if (session == nullptr || session->ConfigureDecoderFrames(context) < 0) {
+          return AV_PIX_FMT_NONE;
+        }
         return *format;
       }
     }
     return AV_PIX_FMT_NONE;
+  }
+
+  static int GetDecoderBuffer(AVCodecContext *context, AVFrame *frame,
+                              int flags) {
+    auto *session = static_cast<FfmpegSession *>(context->opaque);
+    if (session != nullptr && frame->format == AV_PIX_FMT_VAAPI &&
+        session->AcquireDirectDecoderSurface(context, frame) == 0) {
+      return 0;
+    }
+    return avcodec_default_get_buffer2(context, frame, flags);
+  }
+
+  int ConfigureDecoderFrames(AVCodecContext *context) {
+    AVBufferRef *framesContext = nullptr;
+    int result = avcodec_get_hw_frames_parameters(
+        context, device_context_, AV_PIX_FMT_VAAPI, &framesContext);
+    if (result < 0) {
+      ALOGE("querying VAAPI decoder frames for %s failed: %s",
+            spec_.component_name, AvError(result).c_str());
+      return result;
+    }
+
+    auto *frames = reinterpret_cast<AVHWFramesContext *>(framesContext->data);
+    // Modern VA-API accepts dynamically imported render targets. A fixed
+    // FFmpeg pool would allocate private surfaces and bypass the C2 pool.
+    frames->initial_pool_size = 0;
+    result = av_hwframe_ctx_init(framesContext);
+    if (result < 0) {
+      ALOGE("initializing VAAPI decoder frames for %s failed: %s",
+            spec_.component_name, AvError(result).c_str());
+      av_buffer_unref(&framesContext);
+      return result;
+    }
+
+    av_buffer_unref(&context->hw_frames_ctx);
+    context->hw_frames_ctx = framesContext;
+    return 0;
+  }
+
+  c2_status_t AcquireDecoderBlock(uint32_t width, uint32_t height,
+                                  DecoderBlock *output) {
+    if (output == nullptr) {
+      return C2_BAD_VALUE;
+    }
+    output->block.reset();
+
+    while (true) {
+      {
+        std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
+        if (direct_output_disabled_) {
+          return C2_OMITTED;
+        }
+        for (auto it = decoder_pending_blocks_.begin();
+             it != decoder_pending_blocks_.end();) {
+          if (it->descriptor.width != width ||
+              it->descriptor.height != height) {
+            it = decoder_pending_blocks_.erase(it);
+            continue;
+          }
+          if (decoder_active_buffers_.count(it->buffer_id) != 0) {
+            ++it;
+            continue;
+          }
+          *output = std::move(*it);
+          decoder_pending_blocks_.erase(it);
+          return C2_OK;
+        }
+      }
+
+      std::shared_ptr<C2BlockPool> pool;
+      {
+        std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
+        pool = decoder_block_pool_;
+      }
+      if (pool == nullptr) {
+        return C2_NO_INIT;
+      }
+
+      std::shared_ptr<C2GraphicBlock> block;
+      const C2MemoryUsage usage = {
+          GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_COMPOSER,
+          GRALLOC1_PRODUCER_USAGE_VIDEO_DECODER};
+      const c2_status_t result = pool->fetchGraphicBlock(
+          width, height, HAL_PIXEL_FORMAT_YCBCR_420_888, usage, &block);
+      if (result == C2_BLOCKING) {
+        // fetchGraphicBlock applies the BufferQueue backpressure delay. Retry
+        // until either a consumer slot or a released decoder reference exists.
+        continue;
+      }
+      if (result != C2_OK || block == nullptr) {
+        return result == C2_OK ? C2_CORRUPTED : result;
+      }
+
+      NativeHandle handle(
+          android::UnwrapNativeCodec2GrallocHandle(block->handle()));
+      DecoderBlock candidate;
+      candidate.block = std::move(block);
+      if (handle == nullptr ||
+          !GetMinigbmVaDescriptor(handle.get(), width, height,
+                                  &candidate.descriptor,
+                                  &candidate.va_fourcc,
+                                  &candidate.buffer_id)) {
+        return C2_OMITTED;
+      }
+
+      {
+        std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
+        if (decoder_active_buffers_.count(candidate.buffer_id) != 0) {
+          // Android has returned this slot, but the codec still holds it as a
+          // reference picture. Keep it dequeued until both owners release it.
+          decoder_pending_blocks_.push_back(std::move(candidate));
+          continue;
+        }
+      }
+      *output = std::move(candidate);
+      return C2_OK;
+    }
+  }
+
+  int AcquireDirectDecoderSurface(AVCodecContext *context, AVFrame *frame) {
+    if (context->hw_frames_ctx == nullptr || device_context_ == nullptr ||
+        frame->width <= 0 || frame->height <= 0) {
+      return AVERROR(EINVAL);
+    }
+
+    auto *device = reinterpret_cast<AVHWDeviceContext *>(device_context_->data);
+    auto *vaapi = device == nullptr
+                      ? nullptr
+                      : reinterpret_cast<AVVAAPIDeviceContext *>(device->hwctx);
+    if (vaapi == nullptr || vaapi->display == nullptr) {
+      return AVERROR(EINVAL);
+    }
+
+    DecoderBlock decoderBlock;
+    const uint32_t allocationWidth =
+        AlignDecoderOutputWidth(static_cast<uint32_t>(frame->width));
+    const uint32_t allocationHeight = static_cast<uint32_t>(frame->height);
+    const c2_status_t blockResult = AcquireDecoderBlock(
+        allocationWidth, allocationHeight, &decoderBlock);
+    if (blockResult != C2_OK) {
+      if (blockResult != C2_NO_INIT && blockResult != C2_OMITTED) {
+        DisableDirectOutputForC2("acquiring a Codec2 output block",
+                                 blockResult);
+      } else if (blockResult == C2_OMITTED) {
+        DisableDirectOutputForC2("importing a minigbm output block",
+                                 blockResult);
+      }
+      return AVERROR(ENOSYS);
+    }
+
+    VASurfaceAttrib attributes[3]{};
+    attributes[0].type = VASurfaceAttribMemoryType;
+    attributes[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attributes[0].value.type = VAGenericValueTypeInteger;
+    attributes[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+    attributes[1].type = VASurfaceAttribExternalBufferDescriptor;
+    attributes[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attributes[1].value.type = VAGenericValueTypePointer;
+    attributes[1].value.value.p =
+        static_cast<void *>(&decoderBlock.descriptor);
+    attributes[2].type = VASurfaceAttribPixelFormat;
+    attributes[2].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attributes[2].value.type = VAGenericValueTypeInteger;
+    attributes[2].value.value.i = decoderBlock.va_fourcc;
+
+    VASurfaceID surface = VA_INVALID_SURFACE;
+    const VAStatus vaStatus = vaCreateSurfaces(
+        vaapi->display, VA_RT_FORMAT_YUV420, allocationWidth,
+        allocationHeight, &surface, 1, attributes, std::size(attributes));
+    if (vaStatus != VA_STATUS_SUCCESS) {
+      DisableDirectOutputForVa("importing a Codec2 block into VAAPI",
+                               vaStatus);
+      return AVERROR(EIO);
+    }
+
+    auto *reference = new (std::nothrow) DecoderSurfaceReference{
+        this, decoderBlock.buffer_id, surface, std::move(decoderBlock.block)};
+    if (reference == nullptr) {
+      (void)vaDestroySurfaces(vaapi->display, &surface, 1);
+      return AVERROR(ENOMEM);
+    }
+
+    {
+      std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
+      decoder_surfaces_.emplace(surface, reference);
+      decoder_active_buffers_.emplace(reference->buffer_id, reference);
+    }
+
+    frame->hw_frames_ctx = av_buffer_ref(context->hw_frames_ctx);
+    if (frame->hw_frames_ctx == nullptr) {
+      ReleaseDecoderSurfaceReference(reference);
+      return AVERROR(ENOMEM);
+    }
+    frame->buf[0] = av_buffer_create(
+        reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(surface)),
+        sizeof(surface), ReleaseDecoderSurface, reference,
+        AV_BUFFER_FLAG_READONLY);
+    if (frame->buf[0] == nullptr) {
+      av_buffer_unref(&frame->hw_frames_ctx);
+      ReleaseDecoderSurfaceReference(reference);
+      return AVERROR(ENOMEM);
+    }
+    frame->data[3] = frame->buf[0]->data;
+    frame->extended_data = frame->data;
+    return 0;
+  }
+
+  static void ReleaseDecoderSurface(void *opaque, uint8_t *) {
+    auto *reference = static_cast<DecoderSurfaceReference *>(opaque);
+    if (reference != nullptr && reference->owner != nullptr) {
+      reference->owner->ReleaseDecoderSurfaceReference(reference);
+    }
+  }
+
+  void ReleaseDecoderSurfaceReference(DecoderSurfaceReference *reference) {
+    {
+      std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
+      const auto surface = decoder_surfaces_.find(reference->surface);
+      if (surface != decoder_surfaces_.end() &&
+          surface->second == reference) {
+        decoder_surfaces_.erase(surface);
+      }
+      const auto buffer = decoder_active_buffers_.find(reference->buffer_id);
+      if (buffer != decoder_active_buffers_.end() &&
+          buffer->second == reference) {
+        decoder_active_buffers_.erase(buffer);
+      }
+    }
+
+    auto *device = device_context_ == nullptr
+                       ? nullptr
+                       : reinterpret_cast<AVHWDeviceContext *>(
+                             device_context_->data);
+    auto *vaapi = device == nullptr
+                      ? nullptr
+                      : reinterpret_cast<AVVAAPIDeviceContext *>(device->hwctx);
+    if (vaapi != nullptr && vaapi->display != nullptr &&
+        reference->surface != VA_INVALID_SURFACE) {
+      VASurfaceID surface = reference->surface;
+      (void)vaDestroySurfaces(vaapi->display, &surface, 1);
+    }
+    delete reference;
+  }
+
+  void ResetDecoderOutputState() {
+    std::vector<DecoderSurfaceReference *> references;
+    std::vector<DecoderBlock> pending;
+    {
+      std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
+      references.reserve(decoder_surfaces_.size());
+      for (const auto &entry : decoder_surfaces_) {
+        references.push_back(entry.second);
+      }
+      decoder_surfaces_.clear();
+      decoder_active_buffers_.clear();
+      pending.swap(decoder_pending_blocks_);
+      decoder_block_pool_.reset();
+      direct_output_disabled_ = false;
+    }
+    for (DecoderSurfaceReference *reference : references) {
+      ReleaseDecoderSurfaceReference(reference);
+    }
+  }
+
+  void DisableDirectOutputForC2(const char *operation, c2_status_t status) {
+    std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
+    direct_output_disabled_ = true;
+    if (!direct_output_error_logged_) {
+      ALOGW("%s for %s failed (%d); using the CPU output path", operation,
+            spec_.component_name, status);
+      direct_output_error_logged_ = true;
+    }
+  }
+
+  void DisableDirectOutputForVa(const char *operation, VAStatus status) {
+    std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
+    direct_output_disabled_ = true;
+    if (!direct_output_error_logged_) {
+      ALOGW("%s for %s failed: %s; using the CPU output path", operation,
+            spec_.component_name, vaErrorStr(status));
+      direct_output_error_logged_ = true;
+    }
   }
 
   int ConfigureEncoder(const FloralCodecInterface::EncoderSettings &settings) {
@@ -824,14 +1116,6 @@ private:
     return C2_CORRUPTED;
   }
 
-  void LogZeroCopyFailure(const char *operation, VAStatus status) {
-    if (!zero_copy_error_logged_) {
-      ALOGW("%s for %s failed: %s; falling back to CPU output copy", operation,
-            spec_.component_name, vaErrorStr(status));
-      zero_copy_error_logged_ = true;
-    }
-  }
-
   CodecSpec spec_;
   std::string device_path_;
   AVBufferRef *device_context_ = nullptr;
@@ -841,8 +1125,16 @@ private:
   AVFrame *software_frame_ = nullptr;
   AVPacket *packet_ = nullptr;
   VaapiFrameConverter frame_converter_;
+  std::mutex decoder_surface_mutex_;
+  std::shared_ptr<C2BlockPool> decoder_block_pool_;
+  std::unordered_map<VASurfaceID, DecoderSurfaceReference *>
+      decoder_surfaces_;
+  std::unordered_map<uint64_t, DecoderSurfaceReference *>
+      decoder_active_buffers_;
+  std::vector<DecoderBlock> decoder_pending_blocks_;
   bool config_sent_ = false;
-  bool zero_copy_error_logged_ = false;
+  bool direct_output_disabled_ = false;
+  bool direct_output_error_logged_ = false;
 };
 
 class FloralCodecComponent : public android::SimpleC2Component {
@@ -1126,6 +1418,7 @@ private:
   c2_status_t ProcessDecoder(const std::unique_ptr<C2Work> &work,
                              const std::shared_ptr<C2BlockPool> &pool,
                              bool eos) {
+    session_.SetDecoderBlockPool(pool);
     BitstreamCodec bitstreamCodec = BitstreamCodec::kAvc;
     const bool normalizeBitstream = GetDecoderBitstreamCodec(&bitstreamCodec);
     c2_status_t result = ProcessDecoderConfigUpdates(*work, bitstreamCodec,
@@ -1353,6 +1646,7 @@ private:
   c2_status_t DrainDecoder(C2Work *currentWork,
                            const std::shared_ptr<C2BlockPool> &pool,
                            bool draining) {
+    session_.SetDecoderBlockPool(pool);
     PendingOutput pending;
     bool hasPending = false;
     while (true) {
@@ -1373,10 +1667,10 @@ private:
       AVFrame *outputFrame = frame;
       c2_status_t result = C2_OK;
       if (frame->format == AV_PIX_FMT_VAAPI) {
-        result = session_.CreateZeroCopyDecodedBlock(&block);
+        result = session_.GetDirectDecodedBlock(&block);
         if (result != C2_OK) {
-          // Export/import is an optional fast path. Keep the decoder usable
-          // with VA drivers that expose decode but not PRIME export/import.
+          // Keep decoding usable if the allocator cannot provide a PRIME
+          // surface that VA-API can render into directly.
           result = session_.DownloadDecodedFrame(&outputFrame);
         }
       } else {
