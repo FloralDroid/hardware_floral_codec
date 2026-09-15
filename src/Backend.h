@@ -16,33 +16,6 @@
 
 #pragma once
 
-#include "floral/codec/CodecSpec.h"
-
-#include <memory>
-#include <string>
-#include <vector>
-
-namespace floral::codec {
-
-class CapabilityProbe {
-public:
-  static std::unique_ptr<CapabilityProbe> Create(const std::string &devicePath);
-
-  ~CapabilityProbe();
-
-  bool Supports(const CodecSpec &spec) const;
-  const std::string &devicePath() const;
-
-private:
-  struct Impl;
-
-  explicit CapabilityProbe(std::unique_ptr<Impl> impl);
-
-  std::unique_ptr<Impl> impl_;
-};
-
-std::string GetCodecDevicePath();
-std::vector<const CodecSpec *>
-GetSupportedCodecSpecs(const CapabilityProbe &probe);
-
-} // namespace floral::codec
+#if defined(FLORAL_CODEC_BACKEND_VAAPI) == defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+#error "Select exactly one Floral Codec2 backend"
+#endif

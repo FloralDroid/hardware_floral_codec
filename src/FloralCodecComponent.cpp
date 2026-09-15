@@ -16,22 +16,30 @@
 
 #define LOG_TAG "FloralCodec2"
 
+#include "Backend.h"
 #include "floral/codec/BitstreamUtils.h"
 #include "floral/codec/FloralCodecComponent.h"
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
 #include "floral/codec/MinigbmBuffer.h"
 #include "floral/codec/VaapiFrameConverter.h"
+#endif
 
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
 #include <C2AllocatorGralloc.h>
+#endif
 #include <C2Config.h>
 #include <C2PlatformSupport.h>
 #include <SimpleC2Component.h>
 #include <SimpleC2Interface.h>
 #include <android-C2Buffer.h>
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
 #include <cutils/native_handle.h>
 #include <hardware/gralloc.h>
 #include <hardware/gralloc1.h>
+#endif
 #include <log/log.h>
 #include <media/stagefright/foundation/MediaDefs.h>
+#include <system/graphics.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -40,7 +48,9 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
 #include <libavutil/hwcontext_vaapi.h>
+#endif
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
@@ -492,21 +502,28 @@ public:
   c2_status_t
   Open(const FloralCodecInterface::EncoderSettings *encoderSettings) {
     Close();
-    int result =
-        av_hwdevice_ctx_create(&device_context_, AV_HWDEVICE_TYPE_VAAPI,
-                               device_path_.c_str(), nullptr, 0);
+    int result = 0;
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    // Qualcomm Venus is exposed through the kernel V4L2 M2M interface. The
+    // FFmpeg V4L2 wrapper probes /dev/video* when the codec is opened.
+#else
+    result = av_hwdevice_ctx_create(&device_context_, AV_HWDEVICE_TYPE_VAAPI,
+                                    device_path_.c_str(), nullptr, 0);
     if (result < 0) {
       return Fail("creating VA-API device", result);
     }
+#endif
 
     const AVCodec *codec = nullptr;
     if (spec_.direction == CodecDirection::kEncode) {
       codec = avcodec_find_encoder_by_name(spec_.ffmpeg_name);
     } else {
       codec = avcodec_find_decoder_by_name(spec_.ffmpeg_name);
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
       if (codec == nullptr) {
         codec = avcodec_find_decoder(static_cast<AVCodecID>(spec_.codec_id));
       }
+#endif
     }
     if (codec == nullptr) {
       ALOGE("%s is unavailable", spec_.ffmpeg_name);
@@ -517,7 +534,17 @@ public:
     if (context_ == nullptr) {
       return C2_NO_MEMORY;
     }
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     context_->hw_device_ctx = av_buffer_ref(device_context_);
+#else
+    if (!device_path_.empty()) {
+      result =
+          av_opt_set(context_->priv_data, "device", device_path_.c_str(), 0);
+      if (result < 0) {
+        return Fail("selecting V4L2 M2M device", result);
+      }
+    }
+#endif
     context_->opaque = this;
 
     if (spec_.direction == CodecDirection::kEncode) {
@@ -529,8 +556,10 @@ public:
         return Fail("configuring encoder", result);
       }
     } else {
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
       context_->get_format = SelectHardwareFormat;
       context_->get_buffer2 = GetDecoderBuffer;
+#endif
       context_->pkt_timebase = AVRational{1, 1'000'000};
       context_->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
     }
@@ -561,16 +590,22 @@ public:
   }
 
   void Close() {
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     frame_converter_.Reset();
+#endif
     av_packet_free(&packet_);
     av_frame_free(&software_frame_);
     av_frame_free(&frame_);
     avcodec_free_context(&context_);
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     ResetDecoderOutputState();
     av_buffer_unref(&frames_context_);
     av_buffer_unref(&device_context_);
+#endif
     config_sent_ = false;
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     direct_output_error_logged_ = false;
+#endif
   }
 
   AVCodecContext *context() const { return context_; }
@@ -582,6 +617,7 @@ public:
   const CodecSpec &spec() const { return spec_; }
 
   void SetDecoderBlockPool(const std::shared_ptr<C2BlockPool> &pool) {
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
     if (decoder_block_pool_.get() != pool.get()) {
       decoder_pending_blocks_.clear();
@@ -589,10 +625,35 @@ public:
       direct_output_disabled_ = false;
       direct_output_error_logged_ = false;
     }
+#else
+    (void)pool;
+#endif
   }
 
   c2_status_t PrepareEncoderFrame(const C2ConstGraphicBlock &block,
                                   uint64_t frameIndex, bool requestSync) {
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    if (context_ == nullptr) {
+      return C2_NO_INIT;
+    }
+    const C2GraphicView view = block.map().get();
+    if (view.error() != C2_OK) {
+      return view.error();
+    }
+    av_frame_unref(frame_);
+    const int result = PrepareSoftwareEncoderFrame(view);
+    if (result < 0) {
+      return Fail("preparing V4L2 encoder frame", result);
+    }
+    if (av_frame_ref(frame_, software_frame_) < 0) {
+      return C2_NO_MEMORY;
+    }
+    frame_->pts = static_cast<int64_t>(frameIndex);
+    if (requestSync) {
+      frame_->pict_type = AV_PICTURE_TYPE_I;
+    }
+    return C2_OK;
+#else
     if (context_ == nullptr || frames_context_ == nullptr) {
       return C2_NO_INIT;
     }
@@ -634,9 +695,14 @@ public:
       frame_->pict_type = AV_PICTURE_TYPE_I;
     }
     return C2_OK;
+#endif
   }
 
   c2_status_t DownloadDecodedFrame(AVFrame **output) {
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    *output = frame_;
+    return C2_OK;
+#else
     if (frame_->format != AV_PIX_FMT_VAAPI) {
       *output = frame_;
       return C2_OK;
@@ -648,9 +714,14 @@ public:
     }
     *output = software_frame_;
     return C2_OK;
+#endif
   }
 
   c2_status_t GetDirectDecodedBlock(std::shared_ptr<C2GraphicBlock> *block) {
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    (void)block;
+    return C2_OMITTED;
+#else
     if (block == nullptr || frame_->format != AV_PIX_FMT_VAAPI ||
         device_context_ == nullptr) {
       return C2_BAD_VALUE;
@@ -687,9 +758,11 @@ public:
       return C2_CORRUPTED;
     }
     return C2_OK;
+#endif
   }
 
 private:
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
   struct DecoderBlock {
     std::shared_ptr<C2GraphicBlock> block;
     VADRMPRIMESurfaceDescriptor descriptor{};
@@ -1012,6 +1085,7 @@ private:
       direct_output_error_logged_ = true;
     }
   }
+#endif
 
   int ConfigureEncoder(const FloralCodecInterface::EncoderSettings &settings) {
     context_->width = static_cast<int>(settings.width);
@@ -1019,11 +1093,16 @@ private:
     context_->time_base = AVRational{1, 1'000'000};
     context_->framerate =
         AVRational{static_cast<int>(std::round(settings.frame_rate)), 1};
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    context_->pix_fmt = AV_PIX_FMT_NV12;
+#else
     context_->pix_fmt = AV_PIX_FMT_VAAPI;
+#endif
     context_->bit_rate = settings.bitrate;
     const bool constantBitrate =
         settings.bitrate_mode == C2Config::BITRATE_CONST ||
         settings.bitrate_mode == C2Config::BITRATE_CONST_SKIP_ALLOWED;
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     if (constantBitrate) {
       if (context_->priv_data == nullptr) {
         ALOGE("VAAPI encoder has no private rate control options");
@@ -1037,14 +1116,20 @@ private:
         return rateControlResult;
       }
     }
-    // With no max rate, VAAPI auto selection prefers AVBR/VBR and can fall
-    // back to CBR on drivers that do not expose a variable-rate mode.
+#else
+    (void)constantBitrate;
+#endif
+    // Keep max rate unset for variable bitrate and cap it for constant bitrate.
     context_->rc_max_rate = constantBitrate ? settings.bitrate : 0;
     context_->rc_buffer_size = std::max<uint32_t>(settings.bitrate / 2, 1);
     context_->gop_size = std::max<int>(
         1, static_cast<int>(settings.frame_rate * settings.sync_interval_us /
                             1'000'000));
     context_->max_b_frames = 0;
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    context_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER | AV_CODEC_FLAG_LOW_DELAY;
+    return 0;
+#else
     context_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER | AV_CODEC_FLAG_LOW_DELAY;
 
     frames_context_ = av_hwframe_ctx_alloc(device_context_);
@@ -1074,6 +1159,7 @@ private:
       (void)av_opt_set_int(context_->priv_data, "async_depth", 4, 0);
     }
     return 0;
+#endif
   }
 
   int PrepareSoftwareEncoderFrame(const C2GraphicView &view) {
@@ -1177,12 +1263,16 @@ private:
 
   CodecSpec spec_;
   std::string device_path_;
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
   AVBufferRef *device_context_ = nullptr;
   AVBufferRef *frames_context_ = nullptr;
+#endif
   AVCodecContext *context_ = nullptr;
   AVFrame *frame_ = nullptr;
   AVFrame *software_frame_ = nullptr;
   AVPacket *packet_ = nullptr;
+  bool config_sent_ = false;
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
   VaapiFrameConverter frame_converter_;
   std::mutex decoder_surface_mutex_;
   std::shared_ptr<C2BlockPool> decoder_block_pool_;
@@ -1191,9 +1281,9 @@ private:
   std::unordered_map<uint64_t, DecoderSurfaceReference *>
       decoder_active_buffers_;
   std::vector<DecoderBlock> decoder_pending_blocks_;
-  bool config_sent_ = false;
   bool direct_output_disabled_ = false;
   bool direct_output_error_logged_ = false;
+#endif
 };
 
 class FloralCodecComponent : public android::SimpleC2Component {

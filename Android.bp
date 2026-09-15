@@ -20,16 +20,12 @@ cc_library_shared {
         "src/CodecSpec.cpp",
         "src/FloralCodecComponent.cpp",
         "src/FloralCodecStore.cpp",
-        "src/MinigbmBuffer.cpp",
-        "src/VaapiFrameConverter.cpp",
     ],
     local_include_dirs: ["include"],
     export_include_dirs: ["include"],
     header_libs: [
         "libcodec2_internal",
-        "libminigbm_cros_gralloc_headers",
-        "libfloral_va_headers",
-        "libdrm_headers",
+        "libhardware_headers",
     ],
     shared_libs: [
         "libbase",
@@ -39,7 +35,6 @@ cc_library_shared {
         "libcutils",
         "libfloral_ffmpeg_avcodec",
         "libfloral_ffmpeg_avutil",
-        "libfloral_va_prebuilt",
         "libhardware",
         "liblog",
         "libstagefright_foundation",
@@ -54,6 +49,17 @@ cc_library_shared {
     target: {
         android_x86_64: {
             enabled: true,
+            cflags: ["-DFLORAL_CODEC_BACKEND_VAAPI=1"],
+            srcs: [
+                "src/MinigbmBuffer.cpp",
+                "src/VaapiFrameConverter.cpp",
+            ],
+            header_libs: [
+                "libdrm_headers",
+                "libfloral_va_headers",
+                "libminigbm_cros_gralloc_headers",
+            ],
+            shared_libs: ["libfloral_va_prebuilt"],
         },
         android_x86: {
             enabled: false,
@@ -62,7 +68,8 @@ cc_library_shared {
             enabled: false,
         },
         android_arm64: {
-            enabled: false,
+            enabled: true,
+            cflags: ["-DFLORAL_CODEC_BACKEND_V4L2_M2M=1"],
         },
     },
 }

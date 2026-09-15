@@ -42,7 +42,7 @@ std::shared_ptr<C2ComponentStore> FloralCodecStore::Create() {
 
 FloralCodecStore::FloralCodecStore()
     : reflector_(std::make_shared<C2ReflectorHelper>()),
-      device_path_(GetVaapiDevicePath()) {
+      device_path_(GetCodecDevicePath()) {
   std::unique_ptr<CapabilityProbe> probe =
       CapabilityProbe::Create(device_path_);
   if (probe == nullptr) {

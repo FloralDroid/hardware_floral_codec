@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <!-- Static limits describe the Floral component contract. The vendor Codec2
-     store publishes only entries supported by the active VA-API driver. -->
+     store publishes only entries supported by the active hardware backend. -->
 <MediaCodecs>
     <Decoders>
         <MediaCodec name="c2.floral.avc.decoder" type="video/avc">

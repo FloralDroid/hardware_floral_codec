@@ -16,8 +16,15 @@
 
 #include "floral/codec/CodecSpec.h"
 
+#include "Backend.h"
+
 #include <media/stagefright/foundation/MediaDefs.h>
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
 #include <va/va.h>
+#define VA_PROFILES(...) {__VA_ARGS__}
+#else
+#define VA_PROFILES(...) {}
+#endif
 
 extern "C" {
 #include <libavcodec/codec_id.h>
@@ -29,6 +36,30 @@ namespace {
 constexpr uint32_t kDefaultMaxWidth = 4096;
 constexpr uint32_t kDefaultMaxHeight = 4096;
 
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+constexpr char kAvcEncoder[] = "h264_v4l2m2m";
+constexpr char kAvcDecoder[] = "h264_v4l2m2m";
+constexpr char kHevcEncoder[] = "hevc_v4l2m2m";
+constexpr char kHevcDecoder[] = "hevc_v4l2m2m";
+constexpr char kVp8Encoder[] = "vp8_v4l2m2m";
+constexpr char kVp8Decoder[] = "vp8_v4l2m2m";
+constexpr char kVp9Decoder[] = "vp9_v4l2m2m";
+constexpr char kMpeg2Decoder[] = "mpeg2_v4l2m2m";
+#else
+constexpr char kAvcEncoder[] = "h264_vaapi";
+constexpr char kAvcDecoder[] = "h264";
+constexpr char kHevcEncoder[] = "hevc_vaapi";
+constexpr char kHevcDecoder[] = "hevc";
+constexpr char kVp8Encoder[] = "vp8_vaapi";
+constexpr char kVp8Decoder[] = "vp8";
+constexpr char kVp9Encoder[] = "vp9_vaapi";
+constexpr char kVp9Decoder[] = "vp9";
+constexpr char kAv1Encoder[] = "av1_vaapi";
+constexpr char kAv1Decoder[] = "av1";
+constexpr char kMpeg2Encoder[] = "mpeg2_vaapi";
+constexpr char kMpeg2Decoder[] = "mpeg2video";
+#endif
+
 } // namespace
 
 const std::vector<CodecSpec> &GetCodecSpecs() {
@@ -37,98 +68,104 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
   static const std::vector<CodecSpec> specs = {
       {"c2.floral.avc.encoder",
        android::MEDIA_MIMETYPE_VIDEO_AVC,
-       "h264_vaapi",
+       kAvcEncoder,
        AV_CODEC_ID_H264,
        CodecDirection::kEncode,
-       {VAProfileH264High, VAProfileH264Main, VAProfileH264ConstrainedBaseline},
+       VA_PROFILES(VAProfileH264High, VAProfileH264Main,
+                   VAProfileH264ConstrainedBaseline),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
       {"c2.floral.avc.decoder",
        android::MEDIA_MIMETYPE_VIDEO_AVC,
-       "h264",
+       kAvcDecoder,
        AV_CODEC_ID_H264,
        CodecDirection::kDecode,
-       {VAProfileH264High, VAProfileH264Main, VAProfileH264ConstrainedBaseline},
+       VA_PROFILES(VAProfileH264High, VAProfileH264Main,
+                   VAProfileH264ConstrainedBaseline),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
       {"c2.floral.hevc.encoder",
        android::MEDIA_MIMETYPE_VIDEO_HEVC,
-       "hevc_vaapi",
+       kHevcEncoder,
        AV_CODEC_ID_HEVC,
        CodecDirection::kEncode,
-       {VAProfileHEVCMain},
+       VA_PROFILES(VAProfileHEVCMain),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
       {"c2.floral.hevc.decoder",
        android::MEDIA_MIMETYPE_VIDEO_HEVC,
-       "hevc",
+       kHevcDecoder,
        AV_CODEC_ID_HEVC,
        CodecDirection::kDecode,
-       {VAProfileHEVCMain},
+       VA_PROFILES(VAProfileHEVCMain),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
       {"c2.floral.vp8.encoder",
        android::MEDIA_MIMETYPE_VIDEO_VP8,
-       "vp8_vaapi",
+       kVp8Encoder,
        AV_CODEC_ID_VP8,
        CodecDirection::kEncode,
-       {VAProfileVP8Version0_3},
+       VA_PROFILES(VAProfileVP8Version0_3),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
       {"c2.floral.vp8.decoder",
        android::MEDIA_MIMETYPE_VIDEO_VP8,
-       "vp8",
+       kVp8Decoder,
        AV_CODEC_ID_VP8,
        CodecDirection::kDecode,
-       {VAProfileVP8Version0_3},
+       VA_PROFILES(VAProfileVP8Version0_3),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
       {"c2.floral.vp9.encoder",
        android::MEDIA_MIMETYPE_VIDEO_VP9,
-       "vp9_vaapi",
+       kVp9Encoder,
        AV_CODEC_ID_VP9,
        CodecDirection::kEncode,
-       {VAProfileVP9Profile0},
+       VA_PROFILES(VAProfileVP9Profile0),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
+#endif
       {"c2.floral.vp9.decoder",
        android::MEDIA_MIMETYPE_VIDEO_VP9,
-       "vp9",
+       kVp9Decoder,
        AV_CODEC_ID_VP9,
        CodecDirection::kDecode,
-       {VAProfileVP9Profile0},
+       VA_PROFILES(VAProfileVP9Profile0),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
       {"c2.floral.av1.encoder",
        android::MEDIA_MIMETYPE_VIDEO_AV1,
-       "av1_vaapi",
+       kAv1Encoder,
        AV_CODEC_ID_AV1,
        CodecDirection::kEncode,
-       {VAProfileAV1Profile0},
+       VA_PROFILES(VAProfileAV1Profile0),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
       {"c2.floral.av1.decoder",
        android::MEDIA_MIMETYPE_VIDEO_AV1,
-       "av1",
+       kAv1Decoder,
        AV_CODEC_ID_AV1,
        CodecDirection::kDecode,
-       {VAProfileAV1Profile0},
+       VA_PROFILES(VAProfileAV1Profile0),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
       {"c2.floral.mpeg2.encoder",
        android::MEDIA_MIMETYPE_VIDEO_MPEG2,
-       "mpeg2_vaapi",
+       kMpeg2Encoder,
        AV_CODEC_ID_MPEG2VIDEO,
        CodecDirection::kEncode,
-       {VAProfileMPEG2Main, VAProfileMPEG2Simple},
+       VA_PROFILES(VAProfileMPEG2Main, VAProfileMPEG2Simple),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
+#endif
       {"c2.floral.mpeg2.decoder",
        android::MEDIA_MIMETYPE_VIDEO_MPEG2,
-       "mpeg2video",
+       kMpeg2Decoder,
        AV_CODEC_ID_MPEG2VIDEO,
        CodecDirection::kDecode,
-       {VAProfileMPEG2Main, VAProfileMPEG2Simple},
+       VA_PROFILES(VAProfileMPEG2Main, VAProfileMPEG2Simple),
        kDefaultMaxWidth,
        kDefaultMaxHeight},
   };
