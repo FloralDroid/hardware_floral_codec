@@ -60,11 +60,15 @@ public:
       std::vector<C2FieldSupportedValuesQuery> &fields) const override;
 
 private:
+  struct ComponentEntry {
+    const CodecSpec *spec = nullptr;
+    std::string device_path;
+  };
+
   FloralCodecStore();
 
   std::shared_ptr<C2ReflectorHelper> reflector_;
-  std::string device_path_;
-  std::map<C2String, const CodecSpec *> specs_;
+  std::map<C2String, ComponentEntry> components_;
   std::vector<std::shared_ptr<const C2Component::Traits>> traits_;
 };
 

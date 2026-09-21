@@ -334,4 +334,52 @@ bool NormalizeAccessUnit(BitstreamCodec codec, const uint8_t *data,
                    detectedNalLengthSize, false);
 }
 
+bool ExtractCodecConfig(BitstreamCodec codec, const uint8_t *data, size_t size,
+                        std::vector<uint8_t> *output) {
+  if (output == nullptr) {
+    return false;
+  }
+  std::vector<uint8_t> normalized;
+  if (!NormalizeAnnexB(codec, data, size, &normalized)) {
+    output->clear();
+    return false;
+  }
+
+  output->clear();
+  uint32_t foundTypes = 0;
+  size_t offset = 0;
+  while (offset + 4 < normalized.size()) {
+    const size_t nalStart = offset + 4;
+    size_t nalEnd = normalized.size();
+    for (size_t index = nalStart; index + 4 <= normalized.size(); ++index) {
+      if (normalized[index] == 0 && normalized[index + 1] == 0 &&
+          normalized[index + 2] == 0 && normalized[index + 3] == 1) {
+        nalEnd = index;
+        break;
+      }
+    }
+    const uint8_t type = codec == BitstreamCodec::kAvc
+                             ? normalized[nalStart] & 0x1f
+                             : (normalized[nalStart] >> 1) & 0x3f;
+    uint32_t typeBit = 0;
+    if (codec == BitstreamCodec::kAvc) {
+      typeBit = type == 7 ? 1u : (type == 8 ? 2u : 0u);
+    } else {
+      typeBit = type == 32 ? 1u : (type == 33 ? 2u : (type == 34 ? 4u : 0u));
+    }
+    if (typeBit != 0) {
+      output->insert(output->end(), normalized.begin() + offset,
+                     normalized.begin() + nalEnd);
+      foundTypes |= typeBit;
+    }
+    offset = nalEnd;
+  }
+  const uint32_t requiredTypes = codec == BitstreamCodec::kAvc ? 3u : 7u;
+  if (foundTypes != requiredTypes) {
+    output->clear();
+    return false;
+  }
+  return true;
+}
+
 } // namespace floral::codec

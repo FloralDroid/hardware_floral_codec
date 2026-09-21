@@ -20,6 +20,7 @@ cc_library_shared {
         "src/CodecSpec.cpp",
         "src/FloralCodecComponent.cpp",
         "src/FloralCodecStore.cpp",
+        "src/MinigbmDmaBuf.cpp",
     ],
     local_include_dirs: ["include"],
     export_include_dirs: ["include"],
@@ -33,8 +34,6 @@ cc_library_shared {
         "libcodec2_soft_common",
         "libcodec2_vndk",
         "libcutils",
-        "libfloral_ffmpeg_avcodec",
-        "libfloral_ffmpeg_avutil",
         "libhardware",
         "liblog",
         "libstagefright_foundation",
@@ -59,7 +58,11 @@ cc_library_shared {
                 "libfloral_va_headers",
                 "libminigbm_cros_gralloc_headers",
             ],
-            shared_libs: ["libfloral_va_prebuilt"],
+            shared_libs: [
+                "libfloral_ffmpeg_avcodec",
+                "libfloral_ffmpeg_avutil",
+                "libfloral_va_prebuilt",
+            ],
         },
         android_x86: {
             enabled: false,
@@ -70,6 +73,18 @@ cc_library_shared {
         android_arm64: {
             enabled: true,
             cflags: ["-DFLORAL_CODEC_BACKEND_V4L2_M2M=1"],
+            srcs: [
+                "src/GlesFrameConverter.cpp",
+                "src/V4l2CodecSession.cpp",
+            ],
+            header_libs: [
+                "libdrm_headers",
+                "libminigbm_cros_gralloc_headers",
+            ],
+            shared_libs: [
+                "libEGL",
+                "libGLESv3",
+            ],
         },
     },
 }

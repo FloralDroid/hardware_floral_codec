@@ -28,7 +28,7 @@ enum class BitstreamCodec {
 };
 
 // Converts Android's codec configuration records or raw NAL units to the
-// Annex-B form accepted by the FFmpeg decoder. The detected length size is
+// Annex-B form accepted by the hardware decoder. The detected length size is
 // returned for subsequent length-prefixed access units.
 bool NormalizeCodecConfig(BitstreamCodec codec, const uint8_t *data,
                           size_t size, uint8_t preferredNalLengthSize,
@@ -42,5 +42,10 @@ bool NormalizeAccessUnit(BitstreamCodec codec, const uint8_t *data,
                          size_t size, uint8_t preferredNalLengthSize,
                          std::vector<uint8_t> *output,
                          uint8_t *detectedNalLengthSize);
+
+// Extracts AVC SPS/PPS or HEVC VPS/SPS/PPS NAL units from an Annex-B access
+// unit. The output remains Annex-B so Android can publish it as codec init data.
+bool ExtractCodecConfig(BitstreamCodec codec, const uint8_t *data, size_t size,
+                        std::vector<uint8_t> *output);
 
 } // namespace floral::codec

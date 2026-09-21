@@ -26,10 +26,6 @@
 #define VA_PROFILES(...) {}
 #endif
 
-extern "C" {
-#include <libavcodec/codec_id.h>
-}
-
 namespace floral::codec {
 namespace {
 
@@ -69,7 +65,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.avc.encoder",
        android::MEDIA_MIMETYPE_VIDEO_AVC,
        kAvcEncoder,
-       AV_CODEC_ID_H264,
+       CodecType::kAvc,
        CodecDirection::kEncode,
        VA_PROFILES(VAProfileH264High, VAProfileH264Main,
                    VAProfileH264ConstrainedBaseline),
@@ -78,7 +74,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.avc.decoder",
        android::MEDIA_MIMETYPE_VIDEO_AVC,
        kAvcDecoder,
-       AV_CODEC_ID_H264,
+       CodecType::kAvc,
        CodecDirection::kDecode,
        VA_PROFILES(VAProfileH264High, VAProfileH264Main,
                    VAProfileH264ConstrainedBaseline),
@@ -87,7 +83,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.hevc.encoder",
        android::MEDIA_MIMETYPE_VIDEO_HEVC,
        kHevcEncoder,
-       AV_CODEC_ID_HEVC,
+       CodecType::kHevc,
        CodecDirection::kEncode,
        VA_PROFILES(VAProfileHEVCMain),
        kDefaultMaxWidth,
@@ -95,7 +91,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.hevc.decoder",
        android::MEDIA_MIMETYPE_VIDEO_HEVC,
        kHevcDecoder,
-       AV_CODEC_ID_HEVC,
+       CodecType::kHevc,
        CodecDirection::kDecode,
        VA_PROFILES(VAProfileHEVCMain),
        kDefaultMaxWidth,
@@ -103,7 +99,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.vp8.encoder",
        android::MEDIA_MIMETYPE_VIDEO_VP8,
        kVp8Encoder,
-       AV_CODEC_ID_VP8,
+       CodecType::kVp8,
        CodecDirection::kEncode,
        VA_PROFILES(VAProfileVP8Version0_3),
        kDefaultMaxWidth,
@@ -111,7 +107,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.vp8.decoder",
        android::MEDIA_MIMETYPE_VIDEO_VP8,
        kVp8Decoder,
-       AV_CODEC_ID_VP8,
+       CodecType::kVp8,
        CodecDirection::kDecode,
        VA_PROFILES(VAProfileVP8Version0_3),
        kDefaultMaxWidth,
@@ -120,7 +116,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.vp9.encoder",
        android::MEDIA_MIMETYPE_VIDEO_VP9,
        kVp9Encoder,
-       AV_CODEC_ID_VP9,
+       CodecType::kVp9,
        CodecDirection::kEncode,
        VA_PROFILES(VAProfileVP9Profile0),
        kDefaultMaxWidth,
@@ -129,7 +125,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.vp9.decoder",
        android::MEDIA_MIMETYPE_VIDEO_VP9,
        kVp9Decoder,
-       AV_CODEC_ID_VP9,
+       CodecType::kVp9,
        CodecDirection::kDecode,
        VA_PROFILES(VAProfileVP9Profile0),
        kDefaultMaxWidth,
@@ -138,7 +134,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.av1.encoder",
        android::MEDIA_MIMETYPE_VIDEO_AV1,
        kAv1Encoder,
-       AV_CODEC_ID_AV1,
+       CodecType::kAv1,
        CodecDirection::kEncode,
        VA_PROFILES(VAProfileAV1Profile0),
        kDefaultMaxWidth,
@@ -146,7 +142,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.av1.decoder",
        android::MEDIA_MIMETYPE_VIDEO_AV1,
        kAv1Decoder,
-       AV_CODEC_ID_AV1,
+       CodecType::kAv1,
        CodecDirection::kDecode,
        VA_PROFILES(VAProfileAV1Profile0),
        kDefaultMaxWidth,
@@ -154,7 +150,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.mpeg2.encoder",
        android::MEDIA_MIMETYPE_VIDEO_MPEG2,
        kMpeg2Encoder,
-       AV_CODEC_ID_MPEG2VIDEO,
+       CodecType::kMpeg2,
        CodecDirection::kEncode,
        VA_PROFILES(VAProfileMPEG2Main, VAProfileMPEG2Simple),
        kDefaultMaxWidth,
@@ -163,7 +159,7 @@ const std::vector<CodecSpec> &GetCodecSpecs() {
       {"c2.floral.mpeg2.decoder",
        android::MEDIA_MIMETYPE_VIDEO_MPEG2,
        kMpeg2Decoder,
-       AV_CODEC_ID_MPEG2VIDEO,
+       CodecType::kMpeg2,
        CodecDirection::kDecode,
        VA_PROFILES(VAProfileMPEG2Main, VAProfileMPEG2Simple),
        kDefaultMaxWidth,

@@ -41,23 +41,29 @@ std::shared_ptr<C2ComponentStore> FloralCodecStore::Create() {
 }
 
 FloralCodecStore::FloralCodecStore()
-    : reflector_(std::make_shared<C2ReflectorHelper>()),
-      device_path_(GetCodecDevicePath()) {
+    : reflector_(std::make_shared<C2ReflectorHelper>()) {
+  const std::string configuredPath = GetCodecDevicePath();
   std::unique_ptr<CapabilityProbe> probe =
-      CapabilityProbe::Create(device_path_);
+      CapabilityProbe::Create(configuredPath);
   if (probe == nullptr) {
     ALOGW("no Floral hardware codecs will be registered");
     return;
   }
 
-  for (const CodecSpec *spec : GetSupportedCodecSpecs(*probe)) {
-    specs_.emplace(spec->component_name, spec);
+  for (const CodecSpec &spec : GetCodecSpecs()) {
+    std::optional<std::string> devicePath = probe->FindDevicePath(spec);
+    if (!devicePath.has_value()) {
+      ALOGV("disabled unsupported component %s", spec.component_name);
+      continue;
+    }
+    components_.emplace(spec.component_name,
+                        ComponentEntry{&spec, std::move(*devicePath)});
     auto traits = std::make_shared<C2Component::Traits>();
-    traits->name = spec->component_name;
+    traits->name = spec.component_name;
     traits->domain = C2Component::DOMAIN_VIDEO;
-    traits->kind = ToC2Kind(spec->direction);
+    traits->kind = ToC2Kind(spec.direction);
     traits->rank = 128;
-    traits->mediaType = spec->media_type;
+    traits->mediaType = spec.media_type;
     traits->owner = "vendor";
     traits_.push_back(std::move(traits));
   }
@@ -82,11 +88,12 @@ c2_status_t FloralCodecStore::createComponent(
     return C2_BAD_VALUE;
   }
   component->reset();
-  const auto found = specs_.find(name);
-  if (found == specs_.end()) {
+  const auto found = components_.find(name);
+  if (found == components_.end()) {
     return C2_NOT_FOUND;
   }
-  return CreateFloralCodecComponent(*found->second, device_path_, reflector_, 0,
+  return CreateFloralCodecComponent(*found->second.spec,
+                                    found->second.device_path, reflector_, 0,
                                     component);
 }
 
@@ -96,11 +103,12 @@ c2_status_t FloralCodecStore::createInterface(
     return C2_BAD_VALUE;
   }
   interface->reset();
-  const auto found = specs_.find(name);
-  if (found == specs_.end()) {
+  const auto found = components_.find(name);
+  if (found == components_.end()) {
     return C2_NOT_FOUND;
   }
-  return CreateFloralCodecInterface(*found->second, reflector_, 0, interface);
+  return CreateFloralCodecInterface(*found->second.spec, reflector_, 0,
+                                    interface);
 }
 
 c2_status_t FloralCodecStore::copyBuffer(std::shared_ptr<C2GraphicBuffer>,

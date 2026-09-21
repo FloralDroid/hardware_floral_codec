@@ -15,8 +15,8 @@
  */
 
 #include "floral/codec/MinigbmBuffer.h"
+#include "floral/codec/MinigbmDmaBuf.h"
 
-#include <cros_gralloc/cros_gralloc_handle.h>
 #include <drm_fourcc.h>
 #include <drv.h>
 #include <va/va_drmcommon.h>
@@ -27,8 +27,6 @@
 
 namespace floral::codec {
 namespace {
-
-constexpr uint32_t kCrosGrallocMagic = 0xABCDDCBA;
 
 uint32_t ToVaFourcc(uint32_t drmFormat) {
   switch (drmFormat) {
@@ -51,29 +49,6 @@ uint32_t ToVaFourcc(uint32_t drmFormat) {
   }
 }
 
-bool IsValidMinigbmHandle(const native_handle_t *handle,
-                          const cros_gralloc_handle **out) {
-  if (handle == nullptr || handle->version != sizeof(native_handle_t) ||
-      handle->numFds <= 0 || handle->numFds > DRV_MAX_FDS ||
-      handle->numInts < 0) {
-    return false;
-  }
-  const auto *cros = reinterpret_cast<const cros_gralloc_handle *>(handle);
-  if (cros->magic != kCrosGrallocMagic || cros->id == 0 ||
-      cros->num_planes == 0 ||
-      cros->num_planes > DRV_MAX_PLANES ||
-      cros->num_planes > static_cast<uint32_t>(handle->numFds)) {
-    return false;
-  }
-  for (uint32_t plane = 0; plane < cros->num_planes; ++plane) {
-    if (cros->fds[plane] < 0 || cros->strides[plane] == 0) {
-      return false;
-    }
-  }
-  *out = cros;
-  return true;
-}
-
 bool FitsUint32(uint64_t value) {
   return value <= std::numeric_limits<uint32_t>::max();
 }
@@ -84,13 +59,13 @@ bool GetMinigbmVaDescriptor(const native_handle_t *handle, uint32_t width,
                             uint32_t height,
                             VADRMPRIMESurfaceDescriptor *descriptor,
                             uint32_t *vaFourcc, uint64_t *bufferId) {
-  const cros_gralloc_handle *cros = nullptr;
+  MinigbmDmaBuf dmaBuf;
   if (descriptor == nullptr || vaFourcc == nullptr || bufferId == nullptr ||
-      !IsValidMinigbmHandle(handle, &cros) || cros->width != width ||
-      cros->height != height || cros->format_modifier == DRM_FORMAT_MOD_INVALID) {
+      !GetMinigbmDmaBuf(handle, width, height, &dmaBuf) ||
+      dmaBuf.modifier == DRM_FORMAT_MOD_INVALID) {
     return false;
   }
-  const uint32_t fourcc = ToVaFourcc(cros->format);
+  const uint32_t fourcc = ToVaFourcc(dmaBuf.drm_format);
   if (fourcc == 0) {
     return false;
   }
@@ -100,12 +75,12 @@ bool GetMinigbmVaDescriptor(const native_handle_t *handle, uint32_t width,
   descriptor->width = width;
   descriptor->height = height;
   descriptor->num_layers = 1;
-  descriptor->layers[0].drm_format = cros->format;
-  descriptor->layers[0].num_planes = cros->num_planes;
+  descriptor->layers[0].drm_format = dmaBuf.drm_format;
+  descriptor->layers[0].num_planes = dmaBuf.plane_count;
   struct stat objectStats[DRV_MAX_PLANES]{};
-  for (uint32_t plane = 0; plane < cros->num_planes; ++plane) {
+  for (uint32_t plane = 0; plane < dmaBuf.plane_count; ++plane) {
     struct stat planeStats{};
-    if (cros->sizes[plane] == 0 || fstat(cros->fds[plane], &planeStats) != 0) {
+    if (fstat(dmaBuf.planes[plane].fd, &planeStats) != 0) {
       return false;
     }
     uint32_t object = 0;
@@ -119,14 +94,15 @@ bool GetMinigbmVaDescriptor(const native_handle_t *handle, uint32_t width,
       if (object >= DRV_MAX_PLANES) {
         return false;
       }
-      descriptor->objects[object].fd = cros->fds[plane];
-      descriptor->objects[object].size = cros->sizes[plane];
-      descriptor->objects[object].drm_format_modifier = cros->format_modifier;
+      descriptor->objects[object].fd = dmaBuf.planes[plane].fd;
+      descriptor->objects[object].size = dmaBuf.planes[plane].size;
+      descriptor->objects[object].drm_format_modifier = dmaBuf.modifier;
       objectStats[object] = planeStats;
       ++descriptor->num_objects;
     }
-    const uint64_t planeEnd = static_cast<uint64_t>(cros->offsets[plane]) +
-                              cros->sizes[plane];
+    const uint64_t planeEnd =
+        static_cast<uint64_t>(dmaBuf.planes[plane].offset) +
+        dmaBuf.planes[plane].size;
     const uint64_t dmaBufSize = objectStats[object].st_size > 0
                                     ? static_cast<uint64_t>(objectStats[object].st_size)
                                     : 0;
@@ -137,11 +113,11 @@ bool GetMinigbmVaDescriptor(const native_handle_t *handle, uint32_t width,
     }
     descriptor->objects[object].size = static_cast<uint32_t>(objectSize);
     descriptor->layers[0].object_index[plane] = object;
-    descriptor->layers[0].offset[plane] = cros->offsets[plane];
-    descriptor->layers[0].pitch[plane] = cros->strides[plane];
+    descriptor->layers[0].offset[plane] = dmaBuf.planes[plane].offset;
+    descriptor->layers[0].pitch[plane] = dmaBuf.planes[plane].stride;
   }
   *vaFourcc = fourcc;
-  *bufferId = cros->id;
+  *bufferId = dmaBuf.buffer_id;
   return true;
 }
 

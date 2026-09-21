@@ -29,11 +29,20 @@ enum class CodecDirection {
   kEncode,
 };
 
+enum class CodecType {
+  kAvc,
+  kHevc,
+  kVp8,
+  kVp9,
+  kAv1,
+  kMpeg2,
+};
+
 struct CodecSpec {
   const char *component_name;
   const char *media_type;
   const char *ffmpeg_name;
-  int codec_id;
+  CodecType codec;
   CodecDirection direction;
   std::vector<int> va_profiles;
   uint32_t max_width;

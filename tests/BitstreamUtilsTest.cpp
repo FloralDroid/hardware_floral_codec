@@ -127,5 +127,29 @@ TEST(BitstreamUtilsTest, RejectsTruncatedLengthPrefixedNal) {
                                    malformed.size(), 4, &output, nullptr));
 }
 
+TEST(BitstreamUtilsTest, ExtractsAvcCodecConfigFromKeyFrame) {
+  const std::vector<uint8_t> accessUnit = {
+      0, 0, 0, 1, 0x67, 0x64, 0x33, 0, 0, 0, 1, 0x68, 0xee,
+      0, 0, 0, 1, 0x65, 1,    2,
+  };
+  std::vector<uint8_t> config;
+  ASSERT_TRUE(ExtractCodecConfig(BitstreamCodec::kAvc, accessUnit.data(),
+                                 accessUnit.size(), &config));
+  const std::vector<uint8_t> expected = {
+      0, 0, 0, 1, 0x67, 0x64, 0x33,
+      0, 0, 0, 1, 0x68, 0xee,
+  };
+  EXPECT_EQ(expected, config);
+}
+
+TEST(BitstreamUtilsTest, RequiresCompleteCodecConfig) {
+  const std::vector<uint8_t> accessUnit = {0, 0, 0, 1, 0x67, 0x64, 0x33,
+                                            0, 0, 0, 1, 0x65, 1, 2};
+  std::vector<uint8_t> config;
+  EXPECT_FALSE(ExtractCodecConfig(BitstreamCodec::kAvc, accessUnit.data(),
+                                  accessUnit.size(), &config));
+  EXPECT_TRUE(config.empty());
+}
+
 } // namespace
 } // namespace floral::codec

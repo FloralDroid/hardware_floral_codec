@@ -16,31 +16,33 @@
 
 #pragma once
 
-#include "floral/codec/CodecSpec.h"
+#include "floral/codec/MinigbmDmaBuf.h"
+
+#include <C2Buffer.h>
+#include <C2Component.h>
 
 #include <memory>
-#include <optional>
-#include <string>
-#include <vector>
 
 namespace floral::codec {
 
-class CapabilityProbe {
+// Converts an RGB Codec2 GraphicBlock into a linear NV12 DMA-BUF without
+// mapping either buffer on the CPU.
+class GlesFrameConverter final {
 public:
-  static std::unique_ptr<CapabilityProbe> Create(const std::string &devicePath);
+  GlesFrameConverter();
+  ~GlesFrameConverter();
 
-  ~CapabilityProbe();
+  GlesFrameConverter(const GlesFrameConverter &) = delete;
+  GlesFrameConverter &operator=(const GlesFrameConverter &) = delete;
 
-  std::optional<std::string> FindDevicePath(const CodecSpec &spec) const;
+  c2_status_t Initialize();
+  c2_status_t Convert(const C2ConstGraphicBlock &source,
+                      const MinigbmDmaBuf &destination);
+  void Reset();
 
 private:
-  struct Impl;
-
-  explicit CapabilityProbe(std::unique_ptr<Impl> impl);
-
+  class Impl;
   std::unique_ptr<Impl> impl_;
 };
-
-std::string GetCodecDevicePath();
 
 } // namespace floral::codec

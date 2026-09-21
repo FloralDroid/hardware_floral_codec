@@ -22,6 +22,8 @@
 #if defined(FLORAL_CODEC_BACKEND_VAAPI)
 #include "floral/codec/MinigbmBuffer.h"
 #include "floral/codec/VaapiFrameConverter.h"
+#else
+#include "floral/codec/V4l2CodecSession.h"
 #endif
 
 #if defined(FLORAL_CODEC_BACKEND_VAAPI)
@@ -41,6 +43,7 @@
 #include <media/stagefright/foundation/MediaDefs.h>
 #include <system/graphics.h>
 
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
@@ -48,13 +51,12 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
 #include <libavutil/hwcontext_vaapi.h>
-#endif
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
 }
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -85,11 +87,29 @@ constexpr uint32_t kMaxDecoderOutputDelay = 34;
 constexpr uint32_t kDefaultBitrate = 4'000'000;
 constexpr float kDefaultFrameRate = 30.0f;
 constexpr uint32_t kMinInputBufferSize = 2 * 1024 * 1024;
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
 constexpr uint32_t kDecoderOutputWidthAlignment = 32;
-
 constexpr uint32_t AlignDecoderOutputWidth(uint32_t width) {
   return (width + kDecoderOutputWidthAlignment - 1) &
          ~(kDecoderOutputWidthAlignment - 1);
+}
+
+AVCodecID ToAvCodecId(CodecType codec) {
+  switch (codec) {
+  case CodecType::kAvc:
+    return AV_CODEC_ID_H264;
+  case CodecType::kHevc:
+    return AV_CODEC_ID_HEVC;
+  case CodecType::kVp8:
+    return AV_CODEC_ID_VP8;
+  case CodecType::kVp9:
+    return AV_CODEC_ID_VP9;
+  case CodecType::kAv1:
+    return AV_CODEC_ID_AV1;
+  case CodecType::kMpeg2:
+    return AV_CODEC_ID_MPEG2VIDEO;
+  }
+  return AV_CODEC_ID_NONE;
 }
 
 uint8_t ClampByte(int value) {
@@ -103,6 +123,7 @@ std::string AvError(int error) {
   }
   return text;
 }
+#endif
 
 class FloralCodecInterface : public android::SimpleInterface<void>::BaseParams {
 public:
@@ -492,6 +513,7 @@ private:
   std::shared_ptr<C2StreamProfileLevelInfo::output> mEncoderProfileLevel;
 };
 
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
 class FfmpegSession {
 public:
   FfmpegSession(CodecSpec spec, std::string devicePath)
@@ -502,28 +524,21 @@ public:
   c2_status_t
   Open(const FloralCodecInterface::EncoderSettings *encoderSettings) {
     Close();
-    int result = 0;
-#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
-    // Qualcomm Venus is exposed through the kernel V4L2 M2M interface. The
-    // FFmpeg V4L2 wrapper probes /dev/video* when the codec is opened.
-#else
-    result = av_hwdevice_ctx_create(&device_context_, AV_HWDEVICE_TYPE_VAAPI,
-                                    device_path_.c_str(), nullptr, 0);
+    int result = av_hwdevice_ctx_create(
+        &device_context_, AV_HWDEVICE_TYPE_VAAPI, device_path_.c_str(), nullptr,
+        0);
     if (result < 0) {
       return Fail("creating VA-API device", result);
     }
-#endif
 
     const AVCodec *codec = nullptr;
     if (spec_.direction == CodecDirection::kEncode) {
       codec = avcodec_find_encoder_by_name(spec_.ffmpeg_name);
     } else {
       codec = avcodec_find_decoder_by_name(spec_.ffmpeg_name);
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
       if (codec == nullptr) {
-        codec = avcodec_find_decoder(static_cast<AVCodecID>(spec_.codec_id));
+        codec = avcodec_find_decoder(ToAvCodecId(spec_.codec));
       }
-#endif
     }
     if (codec == nullptr) {
       ALOGE("%s is unavailable", spec_.ffmpeg_name);
@@ -534,17 +549,7 @@ public:
     if (context_ == nullptr) {
       return C2_NO_MEMORY;
     }
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     context_->hw_device_ctx = av_buffer_ref(device_context_);
-#else
-    if (!device_path_.empty()) {
-      result =
-          av_opt_set(context_->priv_data, "device", device_path_.c_str(), 0);
-      if (result < 0) {
-        return Fail("selecting V4L2 M2M device", result);
-      }
-    }
-#endif
     context_->opaque = this;
 
     if (spec_.direction == CodecDirection::kEncode) {
@@ -556,10 +561,8 @@ public:
         return Fail("configuring encoder", result);
       }
     } else {
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
       context_->get_format = SelectHardwareFormat;
       context_->get_buffer2 = GetDecoderBuffer;
-#endif
       context_->pkt_timebase = AVRational{1, 1'000'000};
       context_->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
     }
@@ -590,22 +593,16 @@ public:
   }
 
   void Close() {
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     frame_converter_.Reset();
-#endif
     av_packet_free(&packet_);
     av_frame_free(&software_frame_);
     av_frame_free(&frame_);
     avcodec_free_context(&context_);
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     ResetDecoderOutputState();
     av_buffer_unref(&frames_context_);
     av_buffer_unref(&device_context_);
-#endif
     config_sent_ = false;
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     direct_output_error_logged_ = false;
-#endif
   }
 
   AVCodecContext *context() const { return context_; }
@@ -617,7 +614,6 @@ public:
   const CodecSpec &spec() const { return spec_; }
 
   void SetDecoderBlockPool(const std::shared_ptr<C2BlockPool> &pool) {
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     std::scoped_lock<std::mutex> lock(decoder_surface_mutex_);
     if (decoder_block_pool_.get() != pool.get()) {
       decoder_pending_blocks_.clear();
@@ -625,35 +621,10 @@ public:
       direct_output_disabled_ = false;
       direct_output_error_logged_ = false;
     }
-#else
-    (void)pool;
-#endif
   }
 
   c2_status_t PrepareEncoderFrame(const C2ConstGraphicBlock &block,
                                   uint64_t frameIndex, bool requestSync) {
-#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
-    if (context_ == nullptr) {
-      return C2_NO_INIT;
-    }
-    const C2GraphicView view = block.map().get();
-    if (view.error() != C2_OK) {
-      return view.error();
-    }
-    av_frame_unref(frame_);
-    const int result = PrepareSoftwareEncoderFrame(view);
-    if (result < 0) {
-      return Fail("preparing V4L2 encoder frame", result);
-    }
-    if (av_frame_ref(frame_, software_frame_) < 0) {
-      return C2_NO_MEMORY;
-    }
-    frame_->pts = static_cast<int64_t>(frameIndex);
-    if (requestSync) {
-      frame_->pict_type = AV_PICTURE_TYPE_I;
-    }
-    return C2_OK;
-#else
     if (context_ == nullptr || frames_context_ == nullptr) {
       return C2_NO_INIT;
     }
@@ -695,14 +666,9 @@ public:
       frame_->pict_type = AV_PICTURE_TYPE_I;
     }
     return C2_OK;
-#endif
   }
 
   c2_status_t DownloadDecodedFrame(AVFrame **output) {
-#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
-    *output = frame_;
-    return C2_OK;
-#else
     if (frame_->format != AV_PIX_FMT_VAAPI) {
       *output = frame_;
       return C2_OK;
@@ -714,14 +680,9 @@ public:
     }
     *output = software_frame_;
     return C2_OK;
-#endif
   }
 
   c2_status_t GetDirectDecodedBlock(std::shared_ptr<C2GraphicBlock> *block) {
-#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
-    (void)block;
-    return C2_OMITTED;
-#else
     if (block == nullptr || frame_->format != AV_PIX_FMT_VAAPI ||
         device_context_ == nullptr) {
       return C2_BAD_VALUE;
@@ -758,11 +719,9 @@ public:
       return C2_CORRUPTED;
     }
     return C2_OK;
-#endif
   }
 
 private:
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
   struct DecoderBlock {
     std::shared_ptr<C2GraphicBlock> block;
     VADRMPRIMESurfaceDescriptor descriptor{};
@@ -1085,24 +1044,17 @@ private:
       direct_output_error_logged_ = true;
     }
   }
-#endif
-
   int ConfigureEncoder(const FloralCodecInterface::EncoderSettings &settings) {
     context_->width = static_cast<int>(settings.width);
     context_->height = static_cast<int>(settings.height);
     context_->time_base = AVRational{1, 1'000'000};
     context_->framerate =
         AVRational{static_cast<int>(std::round(settings.frame_rate)), 1};
-#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
-    context_->pix_fmt = AV_PIX_FMT_NV12;
-#else
     context_->pix_fmt = AV_PIX_FMT_VAAPI;
-#endif
     context_->bit_rate = settings.bitrate;
     const bool constantBitrate =
         settings.bitrate_mode == C2Config::BITRATE_CONST ||
         settings.bitrate_mode == C2Config::BITRATE_CONST_SKIP_ALLOWED;
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
     if (constantBitrate) {
       if (context_->priv_data == nullptr) {
         ALOGE("VAAPI encoder has no private rate control options");
@@ -1116,9 +1068,6 @@ private:
         return rateControlResult;
       }
     }
-#else
-    (void)constantBitrate;
-#endif
     // Keep max rate unset for variable bitrate and cap it for constant bitrate.
     context_->rc_max_rate = constantBitrate ? settings.bitrate : 0;
     context_->rc_buffer_size = std::max<uint32_t>(settings.bitrate / 2, 1);
@@ -1126,10 +1075,6 @@ private:
         1, static_cast<int>(settings.frame_rate * settings.sync_interval_us /
                             1'000'000));
     context_->max_b_frames = 0;
-#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
-    context_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER | AV_CODEC_FLAG_LOW_DELAY;
-    return 0;
-#else
     context_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER | AV_CODEC_FLAG_LOW_DELAY;
 
     frames_context_ = av_hwframe_ctx_alloc(device_context_);
@@ -1159,7 +1104,6 @@ private:
       (void)av_opt_set_int(context_->priv_data, "async_depth", 4, 0);
     }
     return 0;
-#endif
   }
 
   int PrepareSoftwareEncoderFrame(const C2GraphicView &view) {
@@ -1263,16 +1207,13 @@ private:
 
   CodecSpec spec_;
   std::string device_path_;
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
   AVBufferRef *device_context_ = nullptr;
   AVBufferRef *frames_context_ = nullptr;
-#endif
   AVCodecContext *context_ = nullptr;
   AVFrame *frame_ = nullptr;
   AVFrame *software_frame_ = nullptr;
   AVPacket *packet_ = nullptr;
   bool config_sent_ = false;
-#if defined(FLORAL_CODEC_BACKEND_VAAPI)
   VaapiFrameConverter frame_converter_;
   std::mutex decoder_surface_mutex_;
   std::shared_ptr<C2BlockPool> decoder_block_pool_;
@@ -1283,8 +1224,8 @@ private:
   std::vector<DecoderBlock> decoder_pending_blocks_;
   bool direct_output_disabled_ = false;
   bool direct_output_error_logged_ = false;
-#endif
 };
+#endif
 
 class FloralCodecComponent : public android::SimpleC2Component {
 public:
@@ -1306,7 +1247,22 @@ public:
     if (spec_.direction == CodecDirection::kEncode) {
       const FloralCodecInterface::EncoderSettings settings =
           interface_->GetEncoderSettings();
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+      const V4l2EncoderSettings v4l2Settings{
+          settings.width,
+          settings.height,
+          settings.bitrate,
+          static_cast<uint32_t>(std::round(settings.frame_rate)),
+          static_cast<uint32_t>(std::max<int64_t>(
+              1, static_cast<int64_t>(settings.frame_rate *
+                                      settings.sync_interval_us / 1'000'000))),
+          settings.bitrate_mode == C2Config::BITRATE_CONST ||
+              settings.bitrate_mode == C2Config::BITRATE_CONST_SKIP_ALLOWED};
+      encoder_config_sent_ = false;
+      return session_.Open(&v4l2Settings);
+#else
       return session_.Open(&settings);
+#endif
     }
     return session_.Open(nullptr);
   }
@@ -1327,7 +1283,14 @@ public:
   }
 
   c2_status_t onFlush_sm() override {
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    const c2_status_t flushResult = session_.Flush();
+    if (flushResult != C2_OK) {
+      return flushResult;
+    }
+#else
     session_.Flush();
+#endif
     if (!decoder_config_.empty()) {
       // A Codec2 flush keeps the current stream alive. Re-send its parameter
       // sets with the first access unit after the decoder state is flushed.
@@ -1335,6 +1298,7 @@ public:
     }
     signalled_error_ = false;
     signalled_eos_ = false;
+    encoder_config_sent_ = false;
     return C2_OK;
   }
 
@@ -1371,6 +1335,35 @@ public:
     if (drainMode == DRAIN_CHAIN) {
       return C2_OMITTED;
     }
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    bool sawEos = false;
+    if (spec_.direction == CodecDirection::kEncode) {
+      if (drainMode == DRAIN_COMPONENT_WITH_EOS) {
+        c2_status_t result = session_.StartEncoderDrain();
+        if (result != C2_OK) {
+          return result;
+        }
+        result = DrainV4l2Encoder(nullptr, pool, true, &sawEos);
+        if (result == C2_OK && sawEos) {
+          result = session_.Flush();
+        }
+        return result;
+      }
+      return DrainV4l2Encoder(nullptr, pool, false, &sawEos);
+    }
+    if (drainMode == DRAIN_COMPONENT_WITH_EOS) {
+      c2_status_t result = session_.StartDecoderDrain();
+      if (result != C2_OK) {
+        return result;
+      }
+      result = DrainV4l2Decoder(nullptr, pool, true, &sawEos);
+      if (result == C2_OK && sawEos) {
+        result = session_.Flush();
+      }
+      return result;
+    }
+    return DrainV4l2Decoder(nullptr, pool, false, &sawEos);
+#else
     if (spec_.direction == CodecDirection::kEncode) {
       if (drainMode == DRAIN_COMPONENT_WITH_EOS) {
         int sendResult = avcodec_send_frame(session_.context(), nullptr);
@@ -1407,6 +1400,7 @@ public:
       return result;
     }
     return DrainDecoder(nullptr, pool, false);
+#endif
   }
 
 private:
@@ -1416,9 +1410,382 @@ private:
     std::vector<std::unique_ptr<C2Param>> updates;
   };
 
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+  bool GetBitstreamCodec(BitstreamCodec *codec) const {
+    if (codec == nullptr) {
+      return false;
+    }
+    if (std::strcmp(spec_.media_type, android::MEDIA_MIMETYPE_VIDEO_AVC) == 0) {
+      *codec = BitstreamCodec::kAvc;
+      return true;
+    }
+    if (std::strcmp(spec_.media_type, android::MEDIA_MIMETYPE_VIDEO_HEVC) == 0) {
+      *codec = BitstreamCodec::kHevc;
+      return true;
+    }
+    return false;
+  }
+
+  c2_status_t MakeEncodedBuffer(
+      const V4l2EncodedFrame &frame,
+      const std::shared_ptr<C2BlockPool> &pool,
+      std::shared_ptr<C2Buffer> *buffer,
+      std::vector<std::unique_ptr<C2Param>> *updates) {
+    std::shared_ptr<C2LinearBlock> block;
+    const C2MemoryUsage usage = {C2MemoryUsage::CPU_READ,
+                                 C2MemoryUsage::CPU_WRITE};
+    c2_status_t result = pool->fetchLinearBlock(frame.data.size(), usage, &block);
+    if (result != C2_OK) {
+      return result;
+    }
+    C2WriteView view = block->map().get();
+    if (view.error() != C2_OK) {
+      return view.error();
+    }
+    std::memcpy(view.data(), frame.data.data(), frame.data.size());
+    *buffer = C2Buffer::CreateLinearBuffer(
+        block->share(0, frame.data.size(), C2Fence()));
+    if (frame.key_frame) {
+      (*buffer)->setInfo(std::make_shared<C2StreamPictureTypeMaskInfo::output>(
+          0u, C2Config::SYNC_FRAME));
+    }
+
+    if (!encoder_config_sent_) {
+      BitstreamCodec codec = BitstreamCodec::kAvc;
+      std::vector<uint8_t> configData;
+      if (GetBitstreamCodec(&codec) &&
+          ExtractCodecConfig(codec, frame.data.data(), frame.data.size(),
+                             &configData)) {
+        std::unique_ptr<C2StreamInitDataInfo::output> config =
+            C2StreamInitDataInfo::output::AllocUnique(configData.size(), 0u);
+        if (config == nullptr) {
+          return C2_NO_MEMORY;
+        }
+        std::memcpy(config->m.value, configData.data(), configData.size());
+        updates->push_back(std::move(config));
+        encoder_config_sent_ = true;
+      } else if (GetBitstreamCodec(&codec) && frame.key_frame) {
+        ALOGE("%s produced a key frame without complete codec configuration",
+              spec_.component_name);
+        return C2_CORRUPTED;
+      } else if (!GetBitstreamCodec(&codec)) {
+        encoder_config_sent_ = true;
+      }
+    }
+    return C2_OK;
+  }
+
+  c2_status_t DrainV4l2Encoder(C2Work *currentWork,
+                               const std::shared_ptr<C2BlockPool> &pool,
+                               bool draining, bool *sawEos) {
+    PendingOutput pending;
+    bool hasPending = false;
+    while (true) {
+      V4l2EncodedFrame frame;
+      const c2_status_t dequeueResult =
+          session_.DequeueEncoderFrame(&frame, draining && !*sawEos);
+      if (dequeueResult == C2_NOT_FOUND || dequeueResult == C2_BLOCKING) {
+        break;
+      }
+      if (dequeueResult != C2_OK) {
+        return dequeueResult;
+      }
+      *sawEos = *sawEos || frame.end_of_stream;
+      if (frame.data.empty()) {
+        if (*sawEos) {
+          break;
+        }
+        continue;
+      }
+
+      std::shared_ptr<C2Buffer> buffer;
+      std::vector<std::unique_ptr<C2Param>> updates;
+      c2_status_t result = MakeEncodedBuffer(frame, pool, &buffer, &updates);
+      if (result != C2_OK) {
+        return result;
+      }
+      if (hasPending) {
+        FinishOutput(pending.frame_index, currentWork, pending.buffer,
+                     std::move(pending.updates), C2FrameData::flags_t(0));
+      }
+      pending.frame_index = frame.frame_index;
+      pending.buffer = std::move(buffer);
+      pending.updates = std::move(updates);
+      hasPending = true;
+      if (*sawEos) {
+        break;
+      }
+    }
+    if (hasPending) {
+      FinishOutput(pending.frame_index, currentWork, pending.buffer,
+                   std::move(pending.updates),
+                   *sawEos ? C2FrameData::FLAG_END_OF_STREAM
+                           : C2FrameData::flags_t(0));
+    }
+    return C2_OK;
+  }
+
+  c2_status_t ProcessV4l2Encoder(const std::unique_ptr<C2Work> &work,
+                                 const std::shared_ptr<C2BlockPool> &pool,
+                                 bool eos) {
+    if (!work->input.buffers.empty()) {
+      const FloralCodecInterface::EncoderSettings settings =
+          interface_->GetEncoderSettings();
+      c2_status_t result = session_.QueueEncoderFrame(
+          pool, work->input.buffers.front(),
+          work->input.ordinal.frameIndex.peekull(), settings.request_sync,
+          settings.bitrate);
+      if (result == C2_BLOCKING) {
+        bool ignoredEos = false;
+        result = DrainV4l2Encoder(work.get(), pool, false, &ignoredEos);
+        if (result != C2_OK) {
+          return result;
+        }
+        result = session_.QueueEncoderFrame(
+            pool, work->input.buffers.front(),
+            work->input.ordinal.frameIndex.peekull(), settings.request_sync,
+            settings.bitrate);
+      }
+      if (result != C2_OK) {
+        return result;
+      }
+      if (settings.request_sync) {
+        interface_->ClearSyncRequest();
+      }
+      if (!eos) {
+        bool ignoredEos = false;
+        result = DrainV4l2Encoder(work.get(), pool, false, &ignoredEos);
+        if (result != C2_OK) {
+          return result;
+        }
+      }
+    }
+
+    if (eos) {
+      c2_status_t result = session_.StartEncoderDrain();
+      if (result != C2_OK) {
+        return result;
+      }
+      bool sawEos = false;
+      result = DrainV4l2Encoder(work.get(), pool, true, &sawEos);
+      if (result != C2_OK) {
+        return result;
+      }
+      if (!sawEos) {
+        return C2_TIMED_OUT;
+      }
+      if (work->workletsProcessed != 0u) {
+        work->worklets.front()->output.flags =
+            C2FrameData::flags_t(C2FrameData::FLAG_END_OF_STREAM);
+      } else {
+        FinishEmptyWork(work.get(), true);
+      }
+      signalled_eos_ = true;
+    } else if (work->input.buffers.empty()) {
+      FinishEmptyWork(work.get(), false);
+    }
+    return C2_OK;
+  }
+
+  c2_status_t DrainV4l2Decoder(C2Work *currentWork,
+                               const std::shared_ptr<C2BlockPool> &pool,
+                               bool draining, bool *sawEos) {
+    PendingOutput pending;
+    bool hasPending = false;
+    while (true) {
+      V4l2DecodedFrame frame;
+      const c2_status_t dequeueResult =
+          session_.DequeueDecoderFrame(pool, &frame, draining && !*sawEos);
+      if (dequeueResult == C2_NOT_FOUND || dequeueResult == C2_BLOCKING) {
+        break;
+      }
+      if (dequeueResult != C2_OK) {
+        return dequeueResult;
+      }
+      *sawEos = *sawEos || frame.end_of_stream;
+      if (frame.block == nullptr) {
+        if (*sawEos) {
+          break;
+        }
+        continue;
+      }
+
+      std::vector<std::unique_ptr<C2Param>> updates;
+      c2_status_t result =
+          interface_->UpdateOutputSize(frame.width, frame.height, &updates);
+      if (result != C2_OK) {
+        return result;
+      }
+      std::shared_ptr<C2Buffer> buffer = C2Buffer::CreateGraphicBuffer(
+          frame.block->share(C2Rect(frame.width, frame.height), C2Fence()));
+      if (hasPending) {
+        FinishOutput(pending.frame_index, currentWork, pending.buffer,
+                     std::move(pending.updates), C2FrameData::flags_t(0));
+      }
+      pending.frame_index = frame.frame_index;
+      pending.buffer = std::move(buffer);
+      pending.updates = std::move(updates);
+      hasPending = true;
+      if (*sawEos) {
+        break;
+      }
+    }
+    if (hasPending) {
+      FinishOutput(pending.frame_index, currentWork, pending.buffer,
+                   std::move(pending.updates),
+                   *sawEos ? C2FrameData::FLAG_END_OF_STREAM
+                           : C2FrameData::flags_t(0));
+    }
+    return C2_OK;
+  }
+
+  c2_status_t ProcessV4l2Decoder(const std::unique_ptr<C2Work> &work,
+                                 const std::shared_ptr<C2BlockPool> &pool,
+                                 bool eos) {
+    BitstreamCodec bitstreamCodec = BitstreamCodec::kAvc;
+    const bool normalizeBitstream = GetDecoderBitstreamCodec(&bitstreamCodec);
+    c2_status_t result = ProcessDecoderConfigUpdates(*work, bitstreamCodec,
+                                                     normalizeBitstream);
+    if (result != C2_OK) {
+      return result;
+    }
+
+    const bool codecConfig =
+        (work->input.flags & C2FrameData::FLAG_CODEC_CONFIG) != 0;
+    if (codecConfig && normalizeBitstream) {
+      if (!work->input.buffers.empty()) {
+        const std::shared_ptr<C2Buffer> &input = work->input.buffers.front();
+        if (input->data().type() != C2BufferData::LINEAR ||
+            input->data().linearBlocks().empty()) {
+          return C2_BAD_VALUE;
+        }
+        const C2ReadView view = input->data().linearBlocks().front().map().get();
+        if (view.error() != C2_OK) {
+          return view.error();
+        }
+        result = StoreDecoderConfig(bitstreamCodec, view.data(), view.capacity());
+        if (result != C2_OK) {
+          return result;
+        }
+      }
+      FinishEmptyWork(work.get(), eos);
+      if (eos) {
+        signalled_eos_ = true;
+      }
+      return C2_OK;
+    }
+
+    bool submitted = false;
+    if (!work->input.buffers.empty()) {
+      const std::shared_ptr<C2Buffer> &input = work->input.buffers.front();
+      if (input->data().type() != C2BufferData::LINEAR ||
+          input->data().linearBlocks().empty()) {
+        return C2_BAD_VALUE;
+      }
+      const C2ReadView view = input->data().linearBlocks().front().map().get();
+      if (view.error() != C2_OK) {
+        return view.error();
+      }
+      if (view.capacity() == 0) {
+        if (!eos) {
+          FinishEmptyWork(work.get(), false);
+        }
+      } else {
+        std::vector<uint8_t> normalized;
+        uint8_t detectedNalLengthSize = decoder_nal_length_size_;
+        if (normalizeBitstream &&
+            !NormalizeAccessUnit(bitstreamCodec, view.data(), view.capacity(),
+                                 decoder_nal_length_size_, &normalized,
+                                 &detectedNalLengthSize)) {
+          ALOGE("failed to normalize %s decoder access unit",
+                bitstreamCodec == BitstreamCodec::kAvc ? "AVC" : "HEVC");
+          return C2_CORRUPTED;
+        }
+        if (normalizeBitstream) {
+          decoder_nal_length_size_ = detectedNalLengthSize;
+        } else {
+          normalized.assign(view.data(), view.data() + view.capacity());
+        }
+
+        std::vector<uint8_t> packetData;
+        if (normalizeBitstream && decoder_config_pending_ &&
+            !decoder_config_.empty()) {
+          if (decoder_config_.size() >
+              std::numeric_limits<size_t>::max() - normalized.size()) {
+            return C2_NO_MEMORY;
+          }
+          packetData.reserve(decoder_config_.size() + normalized.size());
+          packetData.insert(packetData.end(), decoder_config_.begin(),
+                            decoder_config_.end());
+          packetData.insert(packetData.end(), normalized.begin(),
+                            normalized.end());
+        } else {
+          packetData = std::move(normalized);
+        }
+
+        result = session_.QueueDecoderPacket(
+            packetData.data(), packetData.size(),
+            work->input.ordinal.frameIndex.peekull());
+        if (result == C2_BLOCKING) {
+          bool ignoredEos = false;
+          result = DrainV4l2Decoder(work.get(), pool, false, &ignoredEos);
+          if (result != C2_OK) {
+            return result;
+          }
+          result = session_.QueueDecoderPacket(
+              packetData.data(), packetData.size(),
+              work->input.ordinal.frameIndex.peekull());
+        }
+        if (result != C2_OK) {
+          return result;
+        }
+        submitted = true;
+        if (normalizeBitstream) {
+          decoder_config_pending_ = false;
+        }
+        if (!eos) {
+          bool ignoredEos = false;
+          result = DrainV4l2Decoder(work.get(), pool, false, &ignoredEos);
+          if (result != C2_OK) {
+            return result;
+          }
+        }
+      }
+    }
+
+    if (eos) {
+      result = session_.StartDecoderDrain();
+      if (result != C2_OK) {
+        return result;
+      }
+      bool sawEos = false;
+      result = DrainV4l2Decoder(work.get(), pool, true, &sawEos);
+      if (result != C2_OK) {
+        return result;
+      }
+      if (!sawEos) {
+        return C2_TIMED_OUT;
+      }
+      if (work->workletsProcessed != 0u) {
+        work->worklets.front()->output.flags =
+            C2FrameData::flags_t(C2FrameData::FLAG_END_OF_STREAM);
+      } else {
+        FinishEmptyWork(work.get(), true);
+      }
+      signalled_eos_ = true;
+    } else if (!submitted) {
+      FinishEmptyWork(work.get(), false);
+    }
+    return C2_OK;
+  }
+#endif
+
   c2_status_t ProcessEncoder(const std::unique_ptr<C2Work> &work,
                              const std::shared_ptr<C2BlockPool> &pool,
                              bool eos) {
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    return ProcessV4l2Encoder(work, pool, eos);
+#else
     if (!work->input.buffers.empty()) {
       const std::shared_ptr<C2Buffer> &input = work->input.buffers.front();
       if (input->data().type() != C2BufferData::GRAPHIC ||
@@ -1486,8 +1853,10 @@ private:
       FinishEmptyWork(work.get(), false);
     }
     return C2_OK;
+#endif
   }
 
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
   c2_status_t DrainEncoder(C2Work *currentWork,
                            const std::shared_ptr<C2BlockPool> &pool,
                            bool draining) {
@@ -1563,10 +1932,14 @@ private:
     }
     return C2_OK;
   }
+#endif
 
   c2_status_t ProcessDecoder(const std::unique_ptr<C2Work> &work,
                              const std::shared_ptr<C2BlockPool> &pool,
                              bool eos) {
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    return ProcessV4l2Decoder(work, pool, eos);
+#else
     session_.SetDecoderBlockPool(pool);
     BitstreamCodec bitstreamCodec = BitstreamCodec::kAvc;
     const bool normalizeBitstream = GetDecoderBitstreamCodec(&bitstreamCodec);
@@ -1727,6 +2100,7 @@ private:
       FinishEmptyWork(work.get(), false);
     }
     return C2_OK;
+#endif
   }
 
   bool GetDecoderBitstreamCodec(BitstreamCodec *codec) const {
@@ -1801,6 +2175,7 @@ private:
     decoder_nal_length_size_ = 4;
   }
 
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
   c2_status_t DrainDecoder(C2Work *currentWork,
                            const std::shared_ptr<C2BlockPool> &pool,
                            bool draining) {
@@ -1898,7 +2273,9 @@ private:
     }
     return C2_OK;
   }
+#endif
 
+#if defined(FLORAL_CODEC_BACKEND_VAAPI)
   static c2_status_t CopyFrameToGraphicView(const AVFrame *frame,
                                             C2GraphicView *view) {
     const C2PlanarLayout &layout = view->layout();
@@ -1934,6 +2311,7 @@ private:
     }
     return C2_OK;
   }
+#endif
 
   void FinishOutput(uint64_t frameIndex, C2Work *currentWork,
                     const std::shared_ptr<C2Buffer> &buffer,
@@ -1981,10 +2359,15 @@ private:
 
   CodecSpec spec_;
   std::shared_ptr<FloralCodecInterface> interface_;
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+  V4l2CodecSession session_;
+#else
   FfmpegSession session_;
+#endif
   std::vector<uint8_t> decoder_config_;
   uint8_t decoder_nal_length_size_ = 4;
   bool decoder_config_pending_ = false;
+  bool encoder_config_sent_ = false;
   bool signalled_error_ = false;
   bool signalled_eos_ = false;
 };

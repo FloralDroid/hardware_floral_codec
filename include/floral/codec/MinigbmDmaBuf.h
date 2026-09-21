@@ -16,31 +16,34 @@
 
 #pragma once
 
-#include "floral/codec/CodecSpec.h"
+#include <cstdint>
 
-#include <memory>
-#include <optional>
-#include <string>
-#include <vector>
+#include <cutils/native_handle.h>
 
 namespace floral::codec {
 
-class CapabilityProbe {
-public:
-  static std::unique_ptr<CapabilityProbe> Create(const std::string &devicePath);
+constexpr uint32_t kMaxDmaBufPlanes = 4;
 
-  ~CapabilityProbe();
-
-  std::optional<std::string> FindDevicePath(const CodecSpec &spec) const;
-
-private:
-  struct Impl;
-
-  explicit CapabilityProbe(std::unique_ptr<Impl> impl);
-
-  std::unique_ptr<Impl> impl_;
+struct DmaBufPlane {
+  int fd = -1;
+  uint32_t stride = 0;
+  uint32_t offset = 0;
+  uint32_t size = 0;
 };
 
-std::string GetCodecDevicePath();
+struct MinigbmDmaBuf {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t drm_format = 0;
+  uint64_t modifier = 0;
+  uint64_t total_size = 0;
+  uint64_t buffer_id = 0;
+  uint32_t plane_count = 0;
+  DmaBufPlane planes[kMaxDmaBufPlanes];
+};
+
+// File descriptors in the returned description remain owned by |handle|.
+bool GetMinigbmDmaBuf(const native_handle_t *handle, uint32_t width,
+                      uint32_t height, MinigbmDmaBuf *output);
 
 } // namespace floral::codec
