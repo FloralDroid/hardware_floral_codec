@@ -1,0 +1,75 @@
+/*
+ * Copyright 2026 FloralDroid
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D source_image;
+layout(set = 0, binding = 1, r8ui) uniform writeonly uimageBuffer y_plane;
+layout(set = 0, binding = 2, rg8ui) uniform writeonly uimageBuffer uv_plane;
+
+layout(push_constant) uniform ConversionParameters {
+  uint width;
+  uint height;
+  uint y_stride;
+  uint uv_stride;
+} parameters;
+
+uint to_unorm(float value) {
+  return uint(round(clamp(value, 0.0, 1.0) * 255.0));
+}
+
+uint to_luma(vec3 rgb) {
+  float y = dot(rgb, vec3(66.0, 129.0, 25.0)) / 256.0 + 16.0 / 255.0;
+  return to_unorm(y);
+}
+
+uvec2 to_chroma(vec3 rgb) {
+  float u = dot(rgb, vec3(-38.0, -74.0, 112.0)) / 256.0 + 128.0 / 255.0;
+  float v = dot(rgb, vec3(112.0, -94.0, -18.0)) / 256.0 + 128.0 / 255.0;
+  return uvec2(to_unorm(u), to_unorm(v));
+}
+
+void main() {
+  uvec2 chroma_position = gl_GlobalInvocationID.xy;
+  uvec2 position = chroma_position * 2;
+  if (position.x >= parameters.width || position.y >= parameters.height) {
+    return;
+  }
+
+  vec3 rgb00 = texelFetch(source_image, ivec2(position), 0).rgb;
+  vec3 rgb10 = texelFetch(source_image, ivec2(position + uvec2(1, 0)), 0).rgb;
+  vec3 rgb01 = texelFetch(source_image, ivec2(position + uvec2(0, 1)), 0).rgb;
+  vec3 rgb11 = texelFetch(source_image, ivec2(position + uvec2(1, 1)), 0).rgb;
+  uint y00 = to_luma(rgb00);
+  uint y10 = to_luma(rgb10);
+  uint y01 = to_luma(rgb01);
+  uint y11 = to_luma(rgb11);
+
+  uint first_row = position.y * parameters.y_stride + position.x;
+  uint second_row = first_row + parameters.y_stride;
+  imageStore(y_plane, int(first_row), uvec4(y00, 0, 0, 0));
+  imageStore(y_plane, int(first_row + 1), uvec4(y10, 0, 0, 0));
+  imageStore(y_plane, int(second_row), uvec4(y01, 0, 0, 0));
+  imageStore(y_plane, int(second_row + 1), uvec4(y11, 0, 0, 0));
+
+  vec3 average_rgb = (rgb00 + rgb10 + rgb01 + rgb11) * 0.25;
+  uvec2 uv = to_chroma(average_rgb);
+  uint uv_index = chroma_position.y * (parameters.uv_stride / 2) +
+                  chroma_position.x;
+  imageStore(uv_plane, int(uv_index), uvec4(uv, 0, 0));
+}

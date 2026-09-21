@@ -10,9 +10,9 @@ x86_64 会探测 AVC、HEVC、VP8、VP9、AV1 和 MPEG-2 编解码器。ARM64 �
 AVC、HEVC、VP8 编码和解码，以及 VP9、MPEG-2 解码。每个方向独立注册，只暴露
 8-bit profile；Android 原有的软件编解码器仍然可用。
 
-ARM64 编码时通过 DMA-BUF 导入 Surface 输入，使用 GLES 将 RGB 转换到线性 NV12，
-再把同一块 DMA-BUF 排入 Venus。解码时把 Codec2 GraphicBlock 直接排入 Venus
-capture 队列。这两条视频帧路径都不在 CPU 上映射或复制像素。
+ARM64 编码时通过 DRM DMA-BUF 导入 Surface 输入，由 Vulkan compute 将 RGB
+直接写入排入 Venus 的线性 NV12 DMA-BUF。解码时把 Codec2 GraphicBlock 直接排入
+Venus capture 队列。这两条视频帧路径都不在 CPU 上映射或复制像素。
 
 ## 运行行为
 
@@ -46,4 +46,5 @@ adb shell dumpsys media.player | grep -F c2.floral
 
 当前不实现受 DRM 保护的输入和 `video/*.secure` 组件。在 P010 等 Android 10-bit
 GraphicBuffer 链路完整实现前，也不会发布 10-bit 能力。ARM64 零拷贝路径目前要求
-使用 minigbm 缓冲区，EGL 支持 DMA-BUF 导入，并且 Venus 支持线性 NV12。
+使用 minigbm 缓冲区，Vulkan 支持 DMA-BUF 和 DRM format modifier，并且 Venus
+支持线性 NV12。

@@ -18,8 +18,8 @@
 
 #include "floral/codec/V4l2CodecSession.h"
 
-#include "floral/codec/GlesFrameConverter.h"
 #include "floral/codec/MinigbmDmaBuf.h"
+#include "floral/codec/VulkanFrameConverter.h"
 
 #include <C2AllocatorGralloc.h>
 #include <C2PlatformSupport.h>
@@ -1159,7 +1159,7 @@ struct V4l2CodecSession::Impl {
   std::string device_path;
   android::base::unique_fd fd;
   std::optional<V4l2EncoderSettings> encoder_settings;
-  GlesFrameConverter frame_converter;
+  VulkanFrameConverter frame_converter;
 
   std::vector<EncoderInputSlot> encoder_inputs;
   std::vector<DecoderInputSlot> decoder_inputs;

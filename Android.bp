@@ -74,7 +74,7 @@ cc_library_shared {
             enabled: true,
             cflags: ["-DFLORAL_CODEC_BACKEND_V4L2_M2M=1"],
             srcs: [
-                "src/GlesFrameConverter.cpp",
+                "src/VulkanFrameConverter.cpp",
                 "src/V4l2CodecSession.cpp",
             ],
             header_libs: [
@@ -82,8 +82,7 @@ cc_library_shared {
                 "libminigbm_cros_gralloc_headers",
             ],
             shared_libs: [
-                "libEGL",
-                "libGLESv3",
+                "libvulkan",
             ],
         },
     },

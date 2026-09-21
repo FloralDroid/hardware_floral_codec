@@ -25,15 +25,15 @@
 
 namespace floral::codec {
 
-// Converts an RGB Codec2 GraphicBlock into a linear NV12 DMA-BUF without
-// mapping either buffer on the CPU.
-class GlesFrameConverter final {
+// Converts an RGB Codec2 DMA-BUF directly into the final linear NV12 DMA-BUF
+// without mapping or copying either buffer on the CPU.
+class VulkanFrameConverter final {
 public:
-  GlesFrameConverter();
-  ~GlesFrameConverter();
+  VulkanFrameConverter();
+  ~VulkanFrameConverter();
 
-  GlesFrameConverter(const GlesFrameConverter &) = delete;
-  GlesFrameConverter &operator=(const GlesFrameConverter &) = delete;
+  VulkanFrameConverter(const VulkanFrameConverter &) = delete;
+  VulkanFrameConverter &operator=(const VulkanFrameConverter &) = delete;
 
   c2_status_t Initialize();
   c2_status_t Convert(const C2ConstGraphicBlock &source,

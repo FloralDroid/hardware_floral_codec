@@ -12,8 +12,8 @@ ARM64 probes AVC, HEVC, and VP8 in both directions, plus VP9 and MPEG-2
 decoders. Each direction is registered independently. Only 8-bit profiles are
 exposed; the software Android codecs remain available.
 
-On ARM64, encoder Surface input is imported as a DMA-BUF and converted from RGB
-to linear NV12 with GLES before the same DMA-BUF is queued to Venus. Decoder
+On ARM64, encoder Surface input is imported as a DRM DMA-BUF and converted by
+Vulkan compute directly into the linear NV12 DMA-BUF queued to Venus. Decoder
 capture buffers are Codec2 GraphicBlocks queued directly to Venus. Video frame
 pixels are not mapped or copied by the CPU on these paths.
 
@@ -52,5 +52,5 @@ versions can use `--video-encoder=c2.floral.avc.encoder`.
 Protected DRM input and `video/*.secure` components are intentionally not
 implemented. P010 and other 10-bit Android GraphicBuffer paths are also not
 advertised until their buffer handling is complete. The ARM64 zero-copy path
-currently requires minigbm buffers, EGL DMA-BUF import, and linear NV12 support
-from Venus.
+currently requires minigbm buffers, Vulkan DMA-BUF and DRM format modifier
+support, and linear NV12 support from Venus.
