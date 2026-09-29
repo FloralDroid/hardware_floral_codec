@@ -59,6 +59,7 @@ extern "C" {
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -87,6 +88,23 @@ constexpr uint32_t kMaxDecoderOutputDelay = 34;
 constexpr uint32_t kDefaultBitrate = 4'000'000;
 constexpr float kDefaultFrameRate = 30.0f;
 constexpr uint32_t kMinInputBufferSize = 2 * 1024 * 1024;
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+constexpr int kDecoderSubmitTimeoutMs = 5000;
+
+H264Profile ToH264Profile(C2Config::profile_t profile) {
+  switch (profile) {
+  case C2Config::PROFILE_AVC_BASELINE:
+    return H264Profile::kBaseline;
+  case C2Config::PROFILE_AVC_CONSTRAINED_BASELINE:
+    return H264Profile::kConstrainedBaseline;
+  case C2Config::PROFILE_AVC_MAIN:
+    return H264Profile::kMain;
+  case C2Config::PROFILE_AVC_HIGH:
+  default:
+    return H264Profile::kHigh;
+  }
+}
+#endif
 #if defined(FLORAL_CODEC_BACKEND_VAAPI)
 constexpr uint32_t kDecoderOutputWidthAlignment = 32;
 constexpr uint32_t AlignDecoderOutputWidth(uint32_t width) {
@@ -135,6 +153,7 @@ public:
     float frame_rate;
     int64_t sync_interval_us;
     bool request_sync;
+    C2Config::profile_t profile;
   };
 
   FloralCodecInterface(const std::shared_ptr<C2ReflectorHelper> &helper,
@@ -168,7 +187,7 @@ public:
         mInputSize->width,         mInputSize->height,
         mBitrate->value,           mBitrateMode->value,
         mFrameRate->value,         mSyncFramePeriod->value,
-        mRequestSync->value == C2_TRUE};
+        mRequestSync->value == C2_TRUE, mEncoderProfileLevel->profile};
   }
 
   void ClearSyncRequest() {
@@ -1257,9 +1276,23 @@ public:
               1, static_cast<int64_t>(settings.frame_rate *
                                       settings.sync_interval_us / 1'000'000))),
           settings.bitrate_mode == C2Config::BITRATE_CONST ||
-              settings.bitrate_mode == C2Config::BITRATE_CONST_SKIP_ALLOWED};
+              settings.bitrate_mode == C2Config::BITRATE_CONST_SKIP_ALLOWED,
+          ToH264Profile(settings.profile)};
       encoder_config_sent_ = false;
-      return session_.Open(&v4l2Settings);
+      encoder_graphic_pool_.reset();
+      c2_status_t result = android::CreateCodec2BlockPool(
+          android::C2PlatformAllocatorStore::GRALLOC, shared_from_this(),
+          &encoder_graphic_pool_);
+      if (result != C2_OK) {
+        ALOGE("creating the GRALLOC conversion pool for %s failed: %d",
+              spec_.component_name, result);
+        return result;
+      }
+      result = session_.Open(&v4l2Settings);
+      if (result != C2_OK) {
+        encoder_graphic_pool_.reset();
+      }
+      return result;
 #else
       return session_.Open(&settings);
 #endif
@@ -1269,6 +1302,9 @@ public:
 
   c2_status_t onStop() override {
     session_.Close();
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    encoder_graphic_pool_.reset();
+#endif
     ClearDecoderConfig();
     signalled_error_ = false;
     signalled_eos_ = false;
@@ -1279,6 +1315,9 @@ public:
 
   void onRelease() override {
     session_.Close();
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    encoder_graphic_pool_.reset();
+#endif
     ClearDecoderConfig();
   }
 
@@ -1532,8 +1571,9 @@ private:
       const FloralCodecInterface::EncoderSettings settings =
           interface_->GetEncoderSettings();
       c2_status_t result = session_.QueueEncoderFrame(
-          pool, work->input.buffers.front(),
-          work->input.ordinal.frameIndex.peekull(), settings.request_sync,
+          encoder_graphic_pool_, work->input.buffers.front(),
+          work->input.ordinal.frameIndex.peekull(),
+          work->input.ordinal.timestamp.peekll(), settings.request_sync,
           settings.bitrate);
       if (result == C2_BLOCKING) {
         bool ignoredEos = false;
@@ -1542,8 +1582,9 @@ private:
           return result;
         }
         result = session_.QueueEncoderFrame(
-            pool, work->input.buffers.front(),
-            work->input.ordinal.frameIndex.peekull(), settings.request_sync,
+            encoder_graphic_pool_, work->input.buffers.front(),
+            work->input.ordinal.frameIndex.peekull(),
+            work->input.ordinal.timestamp.peekll(), settings.request_sync,
             settings.bitrate);
       }
       if (result != C2_OK) {
@@ -1639,6 +1680,41 @@ private:
     return C2_OK;
   }
 
+  c2_status_t QueueV4l2DecoderPacket(
+      C2Work *currentWork, const std::shared_ptr<C2BlockPool> &pool,
+      const uint8_t *data, size_t size, uint64_t frameIndex) {
+    c2_status_t result = session_.QueueDecoderPacket(data, size, frameIndex);
+    if (result != C2_BLOCKING) {
+      return result;
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(kDecoderSubmitTimeoutMs);
+    while (true) {
+      // Capture setup/output must progress before waiting for an input slot.
+      // Keep this packet intact until QBUF succeeds; a full queue is not fatal.
+      bool ignoredEos = false;
+      result = DrainV4l2Decoder(currentWork, pool, false, &ignoredEos);
+      if (result != C2_OK) {
+        return result;
+      }
+      result = session_.QueueDecoderPacket(data, size, frameIndex);
+      if (result != C2_BLOCKING) {
+        return result;
+      }
+      const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now());
+      if (remaining.count() <= 0) {
+        ALOGE("timed out submitting a packet to %s", spec_.component_name);
+        return C2_TIMED_OUT;
+      }
+      result = session_.WaitForDecoderProgress(
+          static_cast<int>(remaining.count()));
+      if (result != C2_OK) {
+        return result;
+      }
+    }
+  }
+
   c2_status_t ProcessV4l2Decoder(const std::unique_ptr<C2Work> &work,
                                  const std::shared_ptr<C2BlockPool> &pool,
                                  bool eos) {
@@ -1723,19 +1799,9 @@ private:
           packetData = std::move(normalized);
         }
 
-        result = session_.QueueDecoderPacket(
-            packetData.data(), packetData.size(),
+        result = QueueV4l2DecoderPacket(
+            work.get(), pool, packetData.data(), packetData.size(),
             work->input.ordinal.frameIndex.peekull());
-        if (result == C2_BLOCKING) {
-          bool ignoredEos = false;
-          result = DrainV4l2Decoder(work.get(), pool, false, &ignoredEos);
-          if (result != C2_OK) {
-            return result;
-          }
-          result = session_.QueueDecoderPacket(
-              packetData.data(), packetData.size(),
-              work->input.ordinal.frameIndex.peekull());
-        }
         if (result != C2_OK) {
           return result;
         }
@@ -2361,6 +2427,7 @@ private:
   std::shared_ptr<FloralCodecInterface> interface_;
 #if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
   V4l2CodecSession session_;
+  std::shared_ptr<C2BlockPool> encoder_graphic_pool_;
 #else
   FfmpegSession session_;
 #endif

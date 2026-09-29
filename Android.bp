@@ -20,6 +20,7 @@ cc_library_shared {
         "src/CodecSpec.cpp",
         "src/FloralCodecComponent.cpp",
         "src/FloralCodecStore.cpp",
+        "src/H264Level.cpp",
         "src/MinigbmDmaBuf.cpp",
     ],
     local_include_dirs: ["include"],
@@ -92,9 +93,12 @@ cc_test_host {
     name: "floral_codec_bitstream_tests_host",
     srcs: [
         "src/BitstreamUtils.cpp",
+        "src/H264Level.cpp",
         "tests/BitstreamUtilsTest.cpp",
+        "tests/H264LevelTest.cpp",
+        "tests/V4l2EncoderMetadataTest.cpp",
     ],
-    local_include_dirs: ["include"],
+    local_include_dirs: ["include", "src"],
     static_libs: ["libgtest", "libgtest_main"],
     test_suites: ["general-tests"],
     cflags: [

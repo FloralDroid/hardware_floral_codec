@@ -21,6 +21,8 @@
 #include "floral/codec/MinigbmDmaBuf.h"
 #include "floral/codec/VulkanFrameConverter.h"
 
+#include "V4l2EncoderMetadata.h"
+
 #include <C2AllocatorGralloc.h>
 #include <C2PlatformSupport.h>
 #include <android-base/unique_fd.h>
@@ -33,6 +35,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -57,6 +61,11 @@ constexpr uint32_t kDecoderCaptureSlack = 4;
 constexpr uint32_t kCompressedBufferSize = 2 * 1024 * 1024;
 constexpr int kBlockingTimeoutMs = 5000;
 constexpr c2_nsecs_t kFenceTimeoutNs = 5'000'000'000LL;
+
+static_assert(static_cast<uint32_t>(H264Level::k1) ==
+              V4L2_MPEG_VIDEO_H264_LEVEL_1_0);
+static_assert(static_cast<uint32_t>(H264Level::k5_2) ==
+              V4L2_MPEG_VIDEO_H264_LEVEL_5_2);
 
 int Ioctl(int fd, unsigned long request, void *argument) {
   int result = 0;
@@ -89,6 +98,20 @@ uint32_t CompressedFormat(const CodecSpec &spec) {
   default:
     return 0;
   }
+}
+
+int32_t V4l2H264Profile(H264Profile profile) {
+  switch (profile) {
+  case H264Profile::kBaseline:
+    return V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE;
+  case H264Profile::kConstrainedBaseline:
+    return V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE;
+  case H264Profile::kMain:
+    return V4L2_MPEG_VIDEO_H264_PROFILE_MAIN;
+  case H264Profile::kHigh:
+    return V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
+  }
+  return V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
 }
 
 timeval FrameIndexToTimestamp(uint64_t frameIndex) {
@@ -169,6 +192,18 @@ bool IsLinearNv12(const MinigbmDmaBuf &buffer) {
          buffer.total_size <= std::numeric_limits<uint32_t>::max();
 }
 
+void LogDmaBufLayout(const char *name, const MinigbmDmaBuf &buffer) {
+  ALOGE("%s layout: %ux%u format=%#x modifier=%#" PRIx64
+        " planes=%u total_size=%" PRIu64,
+        name, buffer.width, buffer.height, buffer.drm_format, buffer.modifier,
+        buffer.plane_count, buffer.total_size);
+  for (uint32_t plane = 0; plane < buffer.plane_count; ++plane) {
+    ALOGE("%s plane %u: stride=%u offset=%u size=%u", name, plane,
+          buffer.planes[plane].stride, buffer.planes[plane].offset,
+          buffer.planes[plane].size);
+  }
+}
+
 } // namespace
 
 struct V4l2CodecSession::Impl {
@@ -219,6 +254,10 @@ struct V4l2CodecSession::Impl {
             device_path.c_str());
       return C2_OMITTED;
     }
+    venus_encoder =
+        spec.direction == CodecDirection::kEncode &&
+        std::strncmp(reinterpret_cast<const char *>(capability.driver),
+                     "qcom-venus", sizeof(capability.driver)) == 0;
 
     if (spec.direction == CodecDirection::kEncode) {
       if (settings == nullptr || settings->width == 0 ||
@@ -243,6 +282,7 @@ struct V4l2CodecSession::Impl {
       StreamOff(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, &capture_streaming);
     }
     encoder_pending.clear();
+    encoder_frame_metadata.clear();
     decoder_pending.clear();
     encoder_inputs.clear();
     decoder_inputs.clear();
@@ -259,6 +299,8 @@ struct V4l2CodecSession::Impl {
     draining = false;
     decoder_received_input = false;
     current_bitrate = 0;
+    encoder_peak_bitrate = 0;
+    venus_encoder = false;
     raw_size = 0;
     raw_stride = 0;
     coded_size = 0;
@@ -391,6 +433,94 @@ struct V4l2CodecSession::Impl {
                : Error("setting V4L2 control");
   }
 
+  c2_status_t SetAndVerifyControl(uint32_t id, int32_t value) {
+    c2_status_t result = SetControl(id, value, true);
+    if (result != C2_OK) {
+      return result;
+    }
+    v4l2_control control{};
+    control.id = id;
+    if (Ioctl(fd.get(), VIDIOC_G_CTRL, &control) < 0) {
+      return Error("reading back V4L2 control");
+    }
+    if (control.value != value) {
+      ALOGE("%s changed required V4L2 control %#x from %d to %d",
+            device_path.c_str(), id, value, control.value);
+      return C2_OMITTED;
+    }
+    return C2_OK;
+  }
+
+  c2_status_t SetEncoderBitrate(uint32_t bitrate) {
+    if (bitrate == 0 ||
+        bitrate > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+      return C2_BAD_VALUE;
+    }
+    // Venus only applies BITRATE_PEAK at STREAMON. Do not pretend that a
+    // successful runtime S_CTRL/G_CTRL also updates the firmware's limit.
+    if (venus_encoder && encoder_configured && bitrate > encoder_peak_bitrate) {
+      ALOGE("encoder target %u exceeds the configured Venus peak %u",
+            bitrate, encoder_peak_bitrate);
+      return C2_BAD_VALUE;
+    }
+    c2_status_t result = SetAndVerifyControl(
+        V4L2_CID_MPEG_VIDEO_BITRATE, static_cast<int32_t>(bitrate));
+    if (result != C2_OK) {
+      return result;
+    }
+    if (venus_encoder && !encoder_configured) {
+      // The driver default is a fixed 2 Mbps, not a limit derived from the
+      // requested target. Use the negotiated bitrate so both agree with SPS.
+      result = SetAndVerifyControl(V4L2_CID_MPEG_VIDEO_BITRATE_PEAK,
+                                   static_cast<int32_t>(bitrate));
+      if (result != C2_OK) {
+        return result;
+      }
+      encoder_peak_bitrate = bitrate;
+      ALOGI("Venus encoder bitrate on %s: target=%u peak=%u",
+            device_path.c_str(), bitrate, encoder_peak_bitrate);
+    }
+    current_bitrate = bitrate;
+    return C2_OK;
+  }
+
+  c2_status_t SetVisibleCrop(uint32_t width, uint32_t height) {
+    v4l2_selection selection{};
+    // The V4L2 selection API uses the single-planar queue type even when the
+    // encoder itself exposes multi-planar buffers.
+    selection.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    selection.target = V4L2_SEL_TGT_CROP;
+    selection.r.width = width;
+    selection.r.height = height;
+    if (Ioctl(fd.get(), VIDIOC_S_SELECTION, &selection) < 0) {
+      ALOGE("setting the %ux%u encoder crop on %s failed: %s", width, height,
+            device_path.c_str(), std::strerror(errno));
+      return C2_OMITTED;
+    }
+
+    v4l2_selection verified{};
+    verified.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    verified.target = V4L2_SEL_TGT_CROP;
+    if (Ioctl(fd.get(), VIDIOC_G_SELECTION, &verified) < 0) {
+      ALOGE("reading back the encoder crop on %s failed: %s",
+            device_path.c_str(), std::strerror(errno));
+      return C2_OMITTED;
+    }
+    if (selection.r.left != 0 || selection.r.top != 0 ||
+        selection.r.width != width || selection.r.height != height ||
+        verified.r.left != 0 || verified.r.top != 0 ||
+        verified.r.width != width || verified.r.height != height) {
+      ALOGE("%s changed encoder crop %ux%u to %ux%u%+d%+d (readback "
+            "%ux%u%+d%+d)",
+            device_path.c_str(), width, height, selection.r.width,
+            selection.r.height, selection.r.left, selection.r.top,
+            verified.r.width, verified.r.height, verified.r.left,
+            verified.r.top);
+      return C2_OMITTED;
+    }
+    return C2_OK;
+  }
+
   c2_status_t ConfigureEncoder(const MinigbmDmaBuf &input) {
     if (!IsLinearNv12(input)) {
       ALOGE("%s requires a linear single-object NV12 DMA-BUF input",
@@ -425,12 +555,21 @@ struct V4l2CodecSession::Impl {
     }
     coded_size = codedFormat.fmt.pix_mp.plane_fmt[0].sizeimage;
 
-    result = SetControl(V4L2_CID_MPEG_VIDEO_BITRATE,
-                        static_cast<int32_t>(encoder_settings->bitrate), true);
+    result = SetVisibleCrop(encoder_settings->width, encoder_settings->height);
     if (result != C2_OK) {
       return result;
     }
-    current_bitrate = encoder_settings->bitrate;
+    ALOGI("encoder layout on %s: visible=%ux%u raw=%ux%u stride=%u "
+          "coded=%ux%u",
+          device_path.c_str(), encoder_settings->width,
+          encoder_settings->height, rawFormat.fmt.pix_mp.width,
+          rawFormat.fmt.pix_mp.height, raw_stride,
+          codedFormat.fmt.pix_mp.width, codedFormat.fmt.pix_mp.height);
+
+    result = SetEncoderBitrate(encoder_settings->bitrate);
+    if (result != C2_OK) {
+      return result;
+    }
     result =
         SetControl(V4L2_CID_MPEG_VIDEO_GOP_SIZE,
                    static_cast<int32_t>(encoder_settings->gop_size), false);
@@ -470,6 +609,43 @@ struct V4l2CodecSession::Impl {
       return Error("setting encoder frame rate");
     }
 
+    if (spec.codec == CodecType::kAvc) {
+      // Cropping changes the visible rectangle but does not guarantee that
+      // Venus reduces the coded SPS width below the luma stride. Include the
+      // stride so the stream never understates its macroblock requirements.
+      const uint32_t codedWidth =
+          std::max({encoder_settings->width, rawFormat.fmt.pix_mp.width,
+                    codedFormat.fmt.pix_mp.width, raw_stride});
+      const uint32_t codedHeight =
+          std::max({encoder_settings->height, rawFormat.fmt.pix_mp.height,
+                    codedFormat.fmt.pix_mp.height});
+      const std::optional<H264Level> level = FindMinimumH264Level(
+          codedWidth, codedHeight, encoder_settings->frame_rate,
+          encoder_settings->bitrate, encoder_settings->h264_profile);
+      if (!level.has_value()) {
+        ALOGE("no H.264 level through 5.2 covers %ux%u@%u and %u bps",
+              codedWidth, codedHeight, encoder_settings->frame_rate,
+              encoder_settings->bitrate);
+        return C2_BAD_VALUE;
+      }
+      result = SetAndVerifyControl(
+          V4L2_CID_MPEG_VIDEO_H264_PROFILE,
+          V4l2H264Profile(encoder_settings->h264_profile));
+      if (result != C2_OK) {
+        return result;
+      }
+      result = SetAndVerifyControl(
+          V4L2_CID_MPEG_VIDEO_H264_LEVEL,
+          static_cast<int32_t>(level.value()));
+      if (result != C2_OK) {
+        return result;
+      }
+      ALOGI("selected H.264 profile %d level control %u for %ux%u@%u",
+            V4l2H264Profile(encoder_settings->h264_profile),
+            static_cast<uint32_t>(level.value()), codedWidth, codedHeight,
+            encoder_settings->frame_rate);
+    }
+
     uint32_t count = 0;
     result = RequestBuffers(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
                             V4L2_MEMORY_DMABUF, kQueueBufferCount, &count);
@@ -477,6 +653,7 @@ struct V4l2CodecSession::Impl {
       return result;
     }
     encoder_inputs.resize(count);
+    encoder_frame_metadata.reserve(count);
 
     result = RequestBuffers(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
                             V4L2_MEMORY_MMAP, kQueueBufferCount, &count);
@@ -561,7 +738,18 @@ struct V4l2CodecSession::Impl {
         return C2_CORRUPTED;
       }
       V4l2EncodedFrame frame;
-      frame.frame_index = TimestampToFrameIndex(buffer.timestamp);
+      if (plane.bytesused != 0) {
+        const std::optional<uint64_t> frameIndex = TakeV4l2EncoderFrameIndex(
+            &encoder_frame_metadata, buffer.timestamp);
+        if (!frameIndex.has_value()) {
+          ALOGE("encoded output on %s has unmatched PTS %lld.%06ld",
+                device_path.c_str(),
+                static_cast<long long>(buffer.timestamp.tv_sec),
+                static_cast<long>(buffer.timestamp.tv_usec));
+          return C2_CORRUPTED;
+        }
+        frame.frame_index = *frameIndex;
+      }
       frame.key_frame = (buffer.flags & V4L2_BUF_FLAG_KEYFRAME) != 0;
       frame.end_of_stream = (buffer.flags & V4L2_BUF_FLAG_LAST) != 0;
       const auto *begin =
@@ -598,12 +786,17 @@ struct V4l2CodecSession::Impl {
     return result > 0 ? C2_OK : Error("polling V4L2 codec");
   }
 
-  c2_status_t QueueEncoderFrame(const std::shared_ptr<C2BlockPool> &pool,
-                                const std::shared_ptr<C2Buffer> &owner,
-                                uint64_t frameIndex, bool requestSync,
-                                uint32_t bitrate) {
+  c2_status_t QueueEncoderFrame(
+      const std::shared_ptr<C2BlockPool> &conversionPool,
+      const std::shared_ptr<C2Buffer> &owner, uint64_t frameIndex,
+      int64_t timestampUs, bool requestSync, uint32_t bitrate) {
     if (owner == nullptr || owner->data().type() != C2BufferData::GRAPHIC ||
         !encoder_settings.has_value()) {
+      return C2_BAD_VALUE;
+    }
+    timeval timestamp{};
+    if (!MakeV4l2EncoderTimestamp(timestampUs, &timestamp)) {
+      ALOGE("invalid encoder PTS: %" PRId64, timestampUs);
       return C2_BAD_VALUE;
     }
     const std::vector<C2ConstGraphicBlock> graphicBlocks =
@@ -629,26 +822,34 @@ struct V4l2CodecSession::Impl {
     }
     std::shared_ptr<C2GraphicBlock> convertedBlock;
     if (!IsLinearNv12(dmaBuf)) {
-      if (pool == nullptr) {
+      if (conversionPool == nullptr) {
         return C2_NO_INIT;
       }
       // SW_READ forces minigbm to allocate a linear NV12 object. Neither the
       // source nor this destination is mapped by the CPU.
       const C2MemoryUsage usage = {
           C2MemoryUsage::CPU_READ | GRALLOC1_CONSUMER_USAGE_VIDEO_ENCODER, 0};
-      result = pool->fetchGraphicBlock(
+      result = conversionPool->fetchGraphicBlock(
           encoder_settings->width, encoder_settings->height,
           HAL_PIXEL_FORMAT_YCBCR_420_888, usage, &convertedBlock);
       if (result != C2_OK) {
+        ALOGE("allocating a pooled NV12 encoder input failed: %d", result);
         return result;
       }
       NativeHandle convertedHandle(
           android::UnwrapNativeCodec2GrallocHandle(convertedBlock->handle()));
-      if (convertedHandle == nullptr ||
-          !GetMinigbmDmaBuf(convertedHandle.get(), encoder_settings->width,
-                            encoder_settings->height, &dmaBuf) ||
-          !IsLinearNv12(dmaBuf)) {
-        ALOGE("failed to allocate a linear NV12 encoder DMA-BUF");
+      if (convertedHandle == nullptr) {
+        ALOGE("failed to unwrap the pooled NV12 encoder block handle");
+        return C2_OMITTED;
+      }
+      if (!GetMinigbmDmaBuf(convertedHandle.get(), encoder_settings->width,
+                            encoder_settings->height, &dmaBuf)) {
+        ALOGE("failed to read the pooled NV12 encoder DMA-BUF layout");
+        return C2_OMITTED;
+      }
+      if (!IsLinearNv12(dmaBuf)) {
+        ALOGE("the pooled GRALLOC block is not linear NV12");
+        LogDmaBufLayout("pooled encoder input", dmaBuf);
         return C2_OMITTED;
       }
       result = frame_converter.Convert(block, dmaBuf);
@@ -657,6 +858,7 @@ struct V4l2CodecSession::Impl {
       }
     }
     if (!encoder_configured) {
+      encoder_settings->bitrate = bitrate;
       result = ConfigureEncoder(dmaBuf);
       if (result != C2_OK) {
         return result;
@@ -675,8 +877,12 @@ struct V4l2CodecSession::Impl {
     auto freeSlot =
         std::find_if(encoder_inputs.begin(), encoder_inputs.end(),
                      [](const EncoderInputSlot &slot) { return !slot.queued; });
-    if (freeSlot == encoder_inputs.end()) {
-      result = WaitForDevice(POLLIN | POLLOUT);
+    if (freeSlot == encoder_inputs.end() ||
+        encoder_frame_metadata.size() >= encoder_inputs.size()) {
+      result = WaitForDevice(
+          encoder_frame_metadata.size() >= encoder_inputs.size()
+              ? POLLIN
+              : POLLIN | POLLOUT);
       if (result != C2_OK) {
         return result;
       }
@@ -687,18 +893,17 @@ struct V4l2CodecSession::Impl {
       freeSlot = std::find_if(
           encoder_inputs.begin(), encoder_inputs.end(),
           [](const EncoderInputSlot &slot) { return !slot.queued; });
-      if (freeSlot == encoder_inputs.end()) {
+      if (freeSlot == encoder_inputs.end() ||
+          encoder_frame_metadata.size() >= encoder_inputs.size()) {
         return C2_BLOCKING;
       }
     }
 
     if (bitrate != current_bitrate) {
-      result = SetControl(V4L2_CID_MPEG_VIDEO_BITRATE,
-                          static_cast<int32_t>(bitrate), true);
+      result = SetEncoderBitrate(bitrate);
       if (result != C2_OK) {
         return result;
       }
-      current_bitrate = bitrate;
     }
     if (requestSync) {
       result = SetControl(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 1, true);
@@ -719,11 +924,17 @@ struct V4l2CodecSession::Impl {
     buffer.index = index;
     buffer.length = 1;
     buffer.m.planes = &plane;
-    buffer.timestamp = FrameIndexToTimestamp(frameIndex);
+    buffer.timestamp = timestamp;
     if (Ioctl(fd.get(), VIDIOC_QBUF, &buffer) < 0) {
       return Error("queueing zero-copy encoder input");
     }
-    freeSlot->owner = owner;
+    // Input DQBUF releases the image, but the work index must survive until
+    // capture DQBUF. Storage is bounded by the input queue and preallocated.
+    encoder_frame_metadata.push_back({timestamp, frameIndex});
+    // Conversion is complete before QBUF, so only the NV12 destination must
+    // remain alive until Venus dequeues it. Direct NV12 inputs keep their
+    // original C2 buffer owner for the same lifetime.
+    freeSlot->owner = convertedBlock == nullptr ? owner : nullptr;
     freeSlot->converted_block = std::move(convertedBlock);
     freeSlot->queued = true;
     return C2_OK;
@@ -1021,7 +1232,8 @@ struct V4l2CodecSession::Impl {
     while (true) {
       v4l2_event event{};
       if (Ioctl(fd.get(), VIDIOC_DQEVENT, &event) < 0) {
-        if (errno != EAGAIN) {
+        // V4L2 reports ENOENT for an empty nonblocking event queue.
+        if (errno != ENOENT && errno != EAGAIN) {
           return Error("dequeueing V4L2 event");
         }
         break;
@@ -1108,6 +1320,39 @@ struct V4l2CodecSession::Impl {
     return PumpDecoderCapture(pool);
   }
 
+  c2_status_t WaitForDecoderProgress(int timeoutMs) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeoutMs);
+    pollfd descriptor{fd.get(), POLLIN | POLLOUT | POLLPRI, 0};
+    int result = 0;
+    while (true) {
+      const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now());
+      if (remaining.count() <= 0) {
+        result = 0;
+        break;
+      }
+      result = poll(&descriptor, 1, static_cast<int>(remaining.count()));
+      if (result >= 0 || errno != EINTR) {
+        break;
+      }
+    }
+    if (result == 0) {
+      ALOGE("timed out waiting for decoder input on %s", device_path.c_str());
+      return C2_TIMED_OUT;
+    }
+    if (result < 0) {
+      return Error("polling V4L2 decoder");
+    }
+    if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
+        (descriptor.revents & descriptor.events) == 0) {
+      ALOGE("decoder poll on %s returned error events 0x%x",
+            device_path.c_str(), static_cast<unsigned>(descriptor.revents));
+      return C2_CORRUPTED;
+    }
+    return C2_OK;
+  }
+
   c2_status_t DequeueDecoderFrame(const std::shared_ptr<C2BlockPool> &pool,
                                   V4l2DecodedFrame *output, bool wait) {
     if (output == nullptr) {
@@ -1162,6 +1407,7 @@ struct V4l2CodecSession::Impl {
   VulkanFrameConverter frame_converter;
 
   std::vector<EncoderInputSlot> encoder_inputs;
+  std::vector<V4l2EncoderFrameMetadata> encoder_frame_metadata;
   std::vector<DecoderInputSlot> decoder_inputs;
   std::vector<DecoderCaptureSlot> decoder_capture;
   std::vector<MappedBuffer> output_mmaps;
@@ -1170,6 +1416,7 @@ struct V4l2CodecSession::Impl {
   std::deque<V4l2DecodedFrame> decoder_pending;
 
   bool encoder_configured = false;
+  bool venus_encoder = false;
   bool decoder_capture_configured = false;
   bool decoder_capture_setup_pending = false;
   bool output_streaming = false;
@@ -1177,6 +1424,7 @@ struct V4l2CodecSession::Impl {
   bool draining = false;
   bool decoder_received_input = false;
   uint32_t current_bitrate = 0;
+  uint32_t encoder_peak_bitrate = 0;
   uint32_t raw_size = 0;
   uint32_t raw_stride = 0;
   uint32_t coded_size = 0;
@@ -1200,12 +1448,12 @@ void V4l2CodecSession::Close() { impl_->Close(); }
 c2_status_t V4l2CodecSession::Flush() { return impl_->Flush(); }
 
 c2_status_t
-V4l2CodecSession::QueueEncoderFrame(const std::shared_ptr<C2BlockPool> &pool,
-                                    const std::shared_ptr<C2Buffer> &buffer,
-                                    uint64_t frameIndex, bool requestSync,
-                                    uint32_t bitrate) {
-  return impl_->QueueEncoderFrame(pool, buffer, frameIndex, requestSync,
-                                  bitrate);
+V4l2CodecSession::QueueEncoderFrame(
+    const std::shared_ptr<C2BlockPool> &conversionPool,
+    const std::shared_ptr<C2Buffer> &buffer, uint64_t frameIndex,
+    int64_t timestampUs, bool requestSync, uint32_t bitrate) {
+  return impl_->QueueEncoderFrame(conversionPool, buffer, frameIndex,
+                                  timestampUs, requestSync, bitrate);
 }
 
 c2_status_t V4l2CodecSession::DequeueEncoderFrame(V4l2EncodedFrame *output,
@@ -1221,6 +1469,10 @@ c2_status_t V4l2CodecSession::QueueDecoderPacket(const uint8_t *data,
                                                  size_t size,
                                                  uint64_t frameIndex) {
   return impl_->QueueDecoderPacket(data, size, frameIndex);
+}
+
+c2_status_t V4l2CodecSession::WaitForDecoderProgress(int timeoutMs) {
+  return impl_->WaitForDecoderProgress(timeoutMs);
 }
 
 c2_status_t

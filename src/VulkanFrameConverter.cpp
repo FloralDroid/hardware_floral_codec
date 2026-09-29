@@ -36,6 +36,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace floral::codec {
@@ -46,6 +47,44 @@ constexpr std::array<const char *, 3> kRequiredDeviceExtensions = {
     VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
 };
+constexpr size_t kSourceCacheCapacity = 8;
+constexpr size_t kDestinationCacheCapacity = 10;
+
+struct BufferSignature {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t drm_format = 0;
+  uint64_t modifier = 0;
+  uint64_t total_size = 0;
+  uint32_t plane_count = 0;
+  std::array<uint32_t, kMaxDmaBufPlanes> strides{};
+  std::array<uint32_t, kMaxDmaBufPlanes> offsets{};
+  std::array<uint32_t, kMaxDmaBufPlanes> sizes{};
+
+  bool operator==(const BufferSignature &other) const {
+    return width == other.width && height == other.height &&
+           drm_format == other.drm_format && modifier == other.modifier &&
+           total_size == other.total_size &&
+           plane_count == other.plane_count && strides == other.strides &&
+           offsets == other.offsets && sizes == other.sizes;
+  }
+};
+
+BufferSignature MakeBufferSignature(const MinigbmDmaBuf &buffer) {
+  BufferSignature signature;
+  signature.width = buffer.width;
+  signature.height = buffer.height;
+  signature.drm_format = buffer.drm_format;
+  signature.modifier = buffer.modifier;
+  signature.total_size = buffer.total_size;
+  signature.plane_count = buffer.plane_count;
+  for (uint32_t plane = 0; plane < buffer.plane_count; ++plane) {
+    signature.strides[plane] = buffer.planes[plane].stride;
+    signature.offsets[plane] = buffer.planes[plane].offset;
+    signature.sizes[plane] = buffer.planes[plane].size;
+  }
+  return signature;
+}
 
 struct NativeHandleDeleter {
   void operator()(native_handle_t *handle) const {
@@ -269,6 +308,20 @@ public:
   void Reset() {
     if (device_ != VK_NULL_HANDLE) {
       (void)vkDeviceWaitIdle(device_);
+      if (source_cache_misses_ != 0 || destination_cache_misses_ != 0) {
+        ALOGI("Vulkan DMA-BUF cache: source=%" PRIu64 "/%" PRIu64
+              " hit/miss, destination=%" PRIu64 "/%" PRIu64 " hit/miss",
+              source_cache_hits_, source_cache_misses_,
+              destination_cache_hits_, destination_cache_misses_);
+      }
+      for (auto &[id, resource] : source_resources_) {
+        (void)id;
+        DestroySource(&resource);
+      }
+      for (auto &[id, resource] : destination_resources_) {
+        (void)id;
+        DestroyDestination(&resource);
+      }
       vkDestroyFence(device_, fence_, nullptr);
       vkDestroyCommandPool(device_, command_pool_, nullptr);
       vkDestroyPipeline(device_, pipeline_, nullptr);
@@ -281,6 +334,8 @@ public:
     if (instance_ != VK_NULL_HANDLE) {
       vkDestroyInstance(instance_, nullptr);
     }
+    source_resources_.clear();
+    destination_resources_.clear();
     instance_ = VK_NULL_HANDLE;
     physical_device_ = VK_NULL_HANDLE;
     device_ = VK_NULL_HANDLE;
@@ -298,6 +353,11 @@ public:
     command_buffer_ = VK_NULL_HANDLE;
     fence_ = VK_NULL_HANDLE;
     get_memory_fd_properties_ = nullptr;
+    cache_use_counter_ = 0;
+    source_cache_hits_ = 0;
+    source_cache_misses_ = 0;
+    destination_cache_hits_ = 0;
+    destination_cache_misses_ = 0;
   }
 
   c2_status_t Convert(const C2ConstGraphicBlock &source,
@@ -319,23 +379,20 @@ public:
       return C2_BAD_VALUE;
     }
 
-    SourceResource sourceResource;
-    DestinationResource destinationResource;
-    c2_status_t result = ImportSource(input, &sourceResource);
+    SourceResource *sourceResource = nullptr;
+    DestinationResource *destinationResource = nullptr;
+    c2_status_t result = GetSourceResource(input, &sourceResource);
     if (result != C2_OK) {
-      DestroySource(&sourceResource);
       return result;
     }
-    result = ImportDestination(destination, &destinationResource);
+    result = GetDestinationResource(destination, &destinationResource);
     if (result != C2_OK) {
-      DestroyDestination(&destinationResource);
-      DestroySource(&sourceResource);
       return result;
     }
 
     VkDescriptorImageInfo sourceDescriptor{};
     sourceDescriptor.sampler = sampler_;
-    sourceDescriptor.imageView = sourceResource.view;
+    sourceDescriptor.imageView = sourceResource->view;
     sourceDescriptor.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     std::array<VkWriteDescriptorSet, 3> writes{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -349,33 +406,35 @@ public:
     writes[1].dstBinding = 1;
     writes[1].descriptorCount = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
-    writes[1].pTexelBufferView = &destinationResource.y_view;
+    writes[1].pTexelBufferView = &destinationResource->y_view;
     writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[2].dstSet = descriptor_set_;
     writes[2].dstBinding = 2;
     writes[2].descriptorCount = 1;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
-    writes[2].pTexelBufferView = &destinationResource.uv_view;
+    writes[2].pTexelBufferView = &destinationResource->uv_view;
     vkUpdateDescriptorSets(device_, writes.size(), writes.data(), 0, nullptr);
 
-    result = Dispatch(sourceResource, destinationResource, destination);
-    DestroyDestination(&destinationResource);
-    DestroySource(&sourceResource);
-    return result;
+    return Dispatch(*sourceResource, *destinationResource, destination);
   }
 
 private:
   struct SourceResource {
+    BufferSignature signature;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+    uint64_t last_used = 0;
   };
 
   struct DestinationResource {
+    BufferSignature signature;
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkBufferView y_view = VK_NULL_HANDLE;
     VkBufferView uv_view = VK_NULL_HANDLE;
+    uint64_t last_used = 0;
   };
 
   bool Check(VkResult result, const char *operation) const {
@@ -538,6 +597,114 @@ private:
     return std::numeric_limits<uint32_t>::max();
   }
 
+  c2_status_t GetSourceResource(const MinigbmDmaBuf &input,
+                                SourceResource **resource) {
+    if (resource == nullptr) {
+      return C2_BAD_VALUE;
+    }
+    const BufferSignature signature = MakeBufferSignature(input);
+    auto found = source_resources_.find(input.buffer_id);
+    if (found != source_resources_.end()) {
+      if (found->second.signature == signature) {
+        found->second.last_used = ++cache_use_counter_;
+        ++source_cache_hits_;
+        *resource = &found->second;
+        return C2_OK;
+      }
+      ALOGW("RGB buffer ID %" PRIu64 " changed layout; reimporting",
+            input.buffer_id);
+      DestroySource(&found->second);
+      source_resources_.erase(found);
+    }
+    if (source_resources_.size() >= kSourceCacheCapacity) {
+      EvictOldestSource();
+    }
+
+    auto [inserted, unused] = source_resources_.try_emplace(input.buffer_id);
+    (void)unused;
+    inserted->second.signature = signature;
+    inserted->second.last_used = ++cache_use_counter_;
+    ++source_cache_misses_;
+    const c2_status_t result = ImportSource(input, &inserted->second);
+    if (result != C2_OK) {
+      DestroySource(&inserted->second);
+      source_resources_.erase(inserted);
+      return result;
+    }
+    *resource = &inserted->second;
+    return C2_OK;
+  }
+
+  c2_status_t GetDestinationResource(const MinigbmDmaBuf &destination,
+                                     DestinationResource **resource) {
+    if (resource == nullptr) {
+      return C2_BAD_VALUE;
+    }
+    const BufferSignature signature = MakeBufferSignature(destination);
+    auto found = destination_resources_.find(destination.buffer_id);
+    if (found != destination_resources_.end()) {
+      if (found->second.signature == signature) {
+        found->second.last_used = ++cache_use_counter_;
+        ++destination_cache_hits_;
+        *resource = &found->second;
+        return C2_OK;
+      }
+      ALOGW("NV12 buffer ID %" PRIu64 " changed layout; reimporting",
+            destination.buffer_id);
+      DestroyDestination(&found->second);
+      destination_resources_.erase(found);
+    }
+    if (destination_resources_.size() >= kDestinationCacheCapacity) {
+      EvictOldestDestination();
+    }
+
+    auto [inserted, unused] =
+        destination_resources_.try_emplace(destination.buffer_id);
+    (void)unused;
+    inserted->second.signature = signature;
+    inserted->second.last_used = ++cache_use_counter_;
+    ++destination_cache_misses_;
+    const c2_status_t result =
+        ImportDestination(destination, &inserted->second);
+    if (result != C2_OK) {
+      DestroyDestination(&inserted->second);
+      destination_resources_.erase(inserted);
+      return result;
+    }
+    *resource = &inserted->second;
+    return C2_OK;
+  }
+
+  void EvictOldestSource() {
+    auto oldest = source_resources_.end();
+    for (auto current = source_resources_.begin();
+         current != source_resources_.end(); ++current) {
+      if (oldest == source_resources_.end() ||
+          current->second.last_used < oldest->second.last_used) {
+        oldest = current;
+      }
+    }
+    if (oldest != source_resources_.end()) {
+      DestroySource(&oldest->second);
+      source_resources_.erase(oldest);
+    }
+  }
+
+  void EvictOldestDestination() {
+    auto oldest = destination_resources_.end();
+    for (auto current = destination_resources_.begin();
+         current != destination_resources_.end(); ++current) {
+      if (oldest == destination_resources_.end() ||
+          current->second.last_used < oldest->second.last_used) {
+        oldest = current;
+      }
+    }
+    if (oldest != destination_resources_.end()) {
+      DestroyDestination(&oldest->second);
+      destination_resources_.erase(oldest);
+    }
+  }
+
   c2_status_t ImportSource(const MinigbmDmaBuf &input,
                            SourceResource *resource) {
     const VkFormat format = VulkanFormatForDrm(input.drm_format);
@@ -609,18 +776,22 @@ private:
     importInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
     importInfo.pNext = &dedicatedInfo;
     importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    importInfo.fd = importFd.get();
+    const int importFdValue = importFd.release();
+    importInfo.fd = importFdValue;
     VkMemoryAllocateInfo allocateInfo{};
     allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocateInfo.pNext = &importInfo;
     allocateInfo.allocationSize = requirements.size;
     allocateInfo.memoryTypeIndex = memoryType;
+    // A successful external-memory import consumes the FD inside this call.
+    // Drop unique_fd ownership first so Android fdsan does not see the
+    // driver's close as a close by the wrong owner.
     if (!Check(vkAllocateMemory(device_, &allocateInfo, nullptr,
                                 &resource->memory),
                "importing RGB DMA-BUF memory")) {
+      close(importFdValue);
       return C2_OMITTED;
     }
-    (void)importFd.release();
     if (!Check(vkBindImageMemory(device_, resource->image, resource->memory, 0),
                "binding RGB DMA-BUF memory")) {
       return C2_OMITTED;
@@ -705,18 +876,22 @@ private:
     dedicatedInfo.buffer = resource->buffer;
     importInfo.pNext = &dedicatedInfo;
     importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    importInfo.fd = importFd.get();
+    const int importFdValue = importFd.release();
+    importInfo.fd = importFdValue;
     VkMemoryAllocateInfo allocateInfo{};
     allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocateInfo.pNext = &importInfo;
     allocateInfo.allocationSize = requirements.size;
     allocateInfo.memoryTypeIndex = memoryType;
+    // A successful external-memory import consumes the FD inside this call.
+    // Drop unique_fd ownership first so Android fdsan does not see the
+    // driver's close as a close by the wrong owner.
     if (!Check(vkAllocateMemory(device_, &allocateInfo, nullptr,
                                 &resource->memory),
                "importing NV12 DMA-BUF memory")) {
+      close(importFdValue);
       return C2_OMITTED;
     }
-    (void)importFd.release();
     if (!Check(
             vkBindBufferMemory(device_, resource->buffer, resource->memory, 0),
             "binding NV12 DMA-BUF memory")) {
@@ -745,7 +920,7 @@ private:
     return C2_OK;
   }
 
-  c2_status_t Dispatch(const SourceResource &source,
+  c2_status_t Dispatch(SourceResource &source,
                        const DestinationResource &destinationResource,
                        const MinigbmDmaBuf &destination) {
     if (!Check(vkResetFences(device_, 1, &fence_),
@@ -766,7 +941,7 @@ private:
     sourceAcquire.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     sourceAcquire.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     sourceAcquire.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    sourceAcquire.oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+    sourceAcquire.oldLayout = source.layout;
     sourceAcquire.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     sourceAcquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
     sourceAcquire.dstQueueFamilyIndex = queue_family_;
@@ -838,6 +1013,7 @@ private:
       (void)vkDeviceWaitIdle(device_);
       return C2_CORRUPTED;
     }
+    source.layout = VK_IMAGE_LAYOUT_GENERAL;
     return C2_OK;
   }
 
@@ -877,6 +1053,13 @@ private:
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
   VkFence fence_ = VK_NULL_HANDLE;
   PFN_vkGetMemoryFdPropertiesKHR get_memory_fd_properties_ = nullptr;
+  std::unordered_map<uint64_t, SourceResource> source_resources_;
+  std::unordered_map<uint64_t, DestinationResource> destination_resources_;
+  uint64_t cache_use_counter_ = 0;
+  uint64_t source_cache_hits_ = 0;
+  uint64_t source_cache_misses_ = 0;
+  uint64_t destination_cache_hits_ = 0;
+  uint64_t destination_cache_misses_ = 0;
 };
 
 VulkanFrameConverter::VulkanFrameConverter()

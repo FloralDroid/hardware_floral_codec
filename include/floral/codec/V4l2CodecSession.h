@@ -17,6 +17,7 @@
 #pragma once
 
 #include "floral/codec/CodecSpec.h"
+#include "floral/codec/H264Level.h"
 
 #include <C2Buffer.h>
 #include <C2Component.h>
@@ -36,6 +37,7 @@ struct V4l2EncoderSettings {
   uint32_t frame_rate = 0;
   uint32_t gop_size = 0;
   bool constant_bitrate = false;
+  H264Profile h264_profile = H264Profile::kHigh;
 };
 
 struct V4l2EncodedFrame {
@@ -65,15 +67,16 @@ public:
   void Close();
   c2_status_t Flush();
 
-  c2_status_t QueueEncoderFrame(const std::shared_ptr<C2BlockPool> &pool,
-                                const std::shared_ptr<C2Buffer> &buffer,
-                                uint64_t frameIndex, bool requestSync,
-                                uint32_t bitrate);
+  c2_status_t QueueEncoderFrame(
+      const std::shared_ptr<C2BlockPool> &conversionPool,
+      const std::shared_ptr<C2Buffer> &buffer, uint64_t frameIndex,
+      int64_t timestampUs, bool requestSync, uint32_t bitrate);
   c2_status_t DequeueEncoderFrame(V4l2EncodedFrame *output, bool wait);
   c2_status_t StartEncoderDrain();
 
   c2_status_t QueueDecoderPacket(const uint8_t *data, size_t size,
                                  uint64_t frameIndex);
+  c2_status_t WaitForDecoderProgress(int timeoutMs);
   c2_status_t DequeueDecoderFrame(const std::shared_ptr<C2BlockPool> &pool,
                                   V4l2DecodedFrame *output, bool wait);
   c2_status_t StartDecoderDrain();
