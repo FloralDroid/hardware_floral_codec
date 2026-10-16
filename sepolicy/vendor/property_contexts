@@ -1,0 +1,1 @@
+ro.boot.floral_codec_seccomp u:object_r:vendor_floral_codec_security_prop:s0 exact bool

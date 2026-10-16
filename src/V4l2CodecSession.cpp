@@ -60,6 +60,16 @@ constexpr uint32_t kQueueBufferCount = 8;
 constexpr uint32_t kDecoderCaptureSlack = 4;
 constexpr uint32_t kCompressedBufferSize = 2 * 1024 * 1024;
 constexpr int kBlockingTimeoutMs = 5000;
+/*
+ * Upper bound for waiting when the encoder input slots are full. A v4l2
+ * M2M queue call must return promptly (C2_BLOCKING) so that a
+ * single-threaded client (queueInput -> dequeueOutput) can drain the
+ * output in between; a long poll here back-pressures the input once the
+ * firmware capture queue fills up, stalling for seconds until the C2
+ * framework times the queue call out and puts the codec in the error
+ * state.
+ */
+constexpr int kEncoderInputWaitMs = 20;
 constexpr c2_nsecs_t kFenceTimeoutNs = 5'000'000'000LL;
 
 static_assert(static_cast<uint32_t>(H264Level::k1) ==
@@ -205,6 +215,16 @@ void LogDmaBufLayout(const char *name, const MinigbmDmaBuf &buffer) {
 }
 
 } // namespace
+
+namespace {
+// Timing diagnostic: log each stage of the encoder input queue path.
+void EncQueuePhase(const char *phase) {
+  ALOGI("FloralV4l2Codec: encq %s t=%lld", phase,
+        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+}  // namespace
 
 struct V4l2CodecSession::Impl {
   struct EncoderInputSlot {
@@ -779,17 +799,21 @@ struct V4l2CodecSession::Impl {
     return result == C2_OK ? PumpEncoderCapture() : result;
   }
 
-  c2_status_t WaitForDevice(short events) {
+  c2_status_t WaitForDevice(short events, int timeoutMs) {
     pollfd descriptor{fd.get(), events, 0};
     int result = 0;
     do {
-      result = poll(&descriptor, 1, kBlockingTimeoutMs);
+      result = poll(&descriptor, 1, timeoutMs);
     } while (result < 0 && errno == EINTR);
     if (result == 0) {
-      ALOGE("timed out waiting for %s", spec.component_name);
+      ALOGV("timed out waiting for %s", spec.component_name);
       return C2_TIMED_OUT;
     }
     return result > 0 ? C2_OK : Error("polling V4L2 codec");
+  }
+
+  c2_status_t WaitForDevice(short events) {
+    return WaitForDevice(events, kBlockingTimeoutMs);
   }
 
   c2_status_t QueueEncoderFrame(
@@ -811,11 +835,13 @@ struct V4l2CodecSession::Impl {
       return C2_BAD_VALUE;
     }
     const C2ConstGraphicBlock &block = graphicBlocks.front();
+    EncQueuePhase("fence_wait");
     c2_status_t result = block.fence().wait(kFenceTimeoutNs);
     if (result != C2_OK) {
       ALOGE("waiting for encoder input fence failed: %d", result);
       return result;
     }
+    EncQueuePhase("fence_ok");
 
     NativeHandle handle(
         android::UnwrapNativeCodec2GrallocHandle(block.handle()));
@@ -858,7 +884,9 @@ struct V4l2CodecSession::Impl {
         LogDmaBufLayout("pooled encoder input", dmaBuf);
         return C2_OMITTED;
       }
+      EncQueuePhase("convert_begin");
       result = frame_converter.Convert(block, dmaBuf);
+      EncQueuePhase("convert_done");
       if (result != C2_OK) {
         return result;
       }
@@ -876,19 +904,23 @@ struct V4l2CodecSession::Impl {
       return C2_BAD_VALUE;
     }
 
+    EncQueuePhase("pump_begin");
     result = PumpEncoder();
     if (result != C2_OK) {
       return result;
     }
+    EncQueuePhase("pump_done");
     auto freeSlot =
         std::find_if(encoder_inputs.begin(), encoder_inputs.end(),
                      [](const EncoderInputSlot &slot) { return !slot.queued; });
     if (freeSlot == encoder_inputs.end() ||
         encoder_frame_metadata.size() >= encoder_inputs.size()) {
+      EncQueuePhase("waitdev_begin");
       result = WaitForDevice(
           encoder_frame_metadata.size() >= encoder_inputs.size()
               ? POLLIN
-              : POLLIN | POLLOUT);
+              : POLLIN | POLLOUT,
+          kEncoderInputWaitMs);
       if (result != C2_OK) {
         return result;
       }
@@ -896,6 +928,7 @@ struct V4l2CodecSession::Impl {
       if (result != C2_OK) {
         return result;
       }
+      EncQueuePhase("waitdev_done");
       freeSlot = std::find_if(
           encoder_inputs.begin(), encoder_inputs.end(),
           [](const EncoderInputSlot &slot) { return !slot.queued; });
@@ -931,9 +964,11 @@ struct V4l2CodecSession::Impl {
     buffer.length = 1;
     buffer.m.planes = &plane;
     buffer.timestamp = timestamp;
+    EncQueuePhase("qbuf_begin");
     if (Ioctl(fd.get(), VIDIOC_QBUF, &buffer) < 0) {
       return Error("queueing zero-copy encoder input");
     }
+    EncQueuePhase("qbuf_done");
     // Input DQBUF releases the image, but the work index must survive until
     // capture DQBUF. Storage is bounded by the input queue and preallocated.
     encoder_frame_metadata.push_back({timestamp, frameIndex});

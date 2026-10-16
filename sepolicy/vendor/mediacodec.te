@@ -1,0 +1,5 @@
+# Independent of the generic Floral device-configuration property group.
+get_prop(mediacodec, vendor_floral_codec_security_prop)
+
+# security_getenforce() reads selinuxfs. Do not grant policy/control operations.
+allow mediacodec selinuxfs:file { open read };

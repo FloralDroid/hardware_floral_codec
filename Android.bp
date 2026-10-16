@@ -114,19 +114,77 @@ cc_binary {
     vendor: true,
     compile_multilib: "64",
     relative_install_path: "hw",
+    cpp_std: "c++17",
     defaults: [
         "hidl_defaults",
         "libcodec2-hidl-defaults",
     ],
-    srcs: ["service/service.cpp"],
+    srcs: [
+        "service/service.cpp",
+        "service/ServiceSandbox.cpp",
+        "service/SelinuxState.cpp",
+    ],
     init_rc: ["service/android.hardware.media.c2@1.2-service-floral.rc"],
+    required: ["floral_codec_seccomp_policy"],
     shared_libs: [
+        "libbase",
         "libbinder",
         "libfloral_codec2",
         "libhidlbase",
         "liblog",
+        "libminijail",
+        "libselinux",
         "libutils",
     ],
+}
+
+prebuilt_etc {
+    name: "floral_codec_seccomp_policy",
+    vendor: true,
+    sub_dir: "seccomp_policy",
+    filename: "floral-codec.policy",
+    required: ["floral_codec_seccomp_common_policy"],
+    arch: {
+        arm64: {
+            src: "config/seccomp/codec-arm64.policy",
+        },
+        x86_64: {
+            src: "config/seccomp/codec-x86_64.policy",
+        },
+        arm: {
+            enabled: false,
+        },
+        x86: {
+            enabled: false,
+        },
+    },
+}
+
+prebuilt_etc {
+    name: "floral_codec_seccomp_common_policy",
+    vendor: true,
+    sub_dir: "seccomp_policy",
+    filename: "floral-codec-common.policy",
+    src: "config/seccomp/codec-common.policy",
+}
+
+cc_test_host {
+    name: "floral_codec_sandbox_mode_tests_host",
+    srcs: ["tests/SandboxModeTest.cpp"],
+    local_include_dirs: ["service"],
+    static_libs: ["libgtest", "libgtest_main"],
+    test_suites: ["general-tests"],
+    cflags: ["-Wall", "-Werror", "-Wextra"],
+    cpp_std: "c++17",
+}
+
+cc_test_host {
+    name: "floral_codec_selinux_state_tests_host",
+    srcs: ["tests/SelinuxStateTest.cpp", "service/SelinuxState.cpp"],
+    local_include_dirs: ["service"],
+    shared_libs: ["libselinux"],
+    cflags: ["-Wall", "-Werror", "-Wextra"],
+    cpp_std: "c++17",
 }
 
 prebuilt_etc {

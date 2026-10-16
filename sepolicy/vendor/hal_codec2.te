@@ -1,0 +1,4 @@
+# BufferPool status/invalidation FMQs can be created by the app or framework
+# client, not only by the Codec2 service. Synchronized readers also update the
+# queue pointers. Existing Binder rules already authorize use of the passed FD.
+allow hal_codec2_server { appdomain_tmpfs system_server_tmpfs }:file { read write getattr map };

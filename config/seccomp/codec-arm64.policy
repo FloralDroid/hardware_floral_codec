@@ -1,0 +1,3 @@
+# Copyright 2026 FloralDroid
+# SPDX-License-Identifier: Apache-2.0
+@include /vendor/etc/seccomp_policy/floral-codec-common.policy

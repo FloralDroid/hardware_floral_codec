@@ -49,6 +49,9 @@ versions can use `--video-encoder=c2.floral.avc.encoder`.
 
 ## Limits
 
+See [Service security modes](SECURITY.md) for the production syscall sandbox and
+the explicit development opt-out. This is independent of codec/backend selection.
+
 Protected DRM input and `video/*.secure` components are intentionally not
 implemented. P010 and other 10-bit Android GraphicBuffer paths are also not
 advertised until their buffer handling is complete. The ARM64 zero-copy path
