@@ -40,6 +40,17 @@ struct V4l2EncoderSettings {
   H264Profile h264_profile = H264Profile::kHigh;
 };
 
+/*
+ * Real picture size of the decoder, available once the application has
+ * configured the component. The Venus firmware allocates its internal
+ * resources per session dimensions; a mismatch triggers a sequence change
+ * after SPS parsing with only ~115ms to reallocate the capture buffers.
+ */
+struct V4l2DecoderSettings {
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+
 struct V4l2EncodedFrame {
   std::vector<uint8_t> data;
   uint64_t frame_index = 0;
@@ -63,7 +74,8 @@ public:
   V4l2CodecSession(const V4l2CodecSession &) = delete;
   V4l2CodecSession &operator=(const V4l2CodecSession &) = delete;
 
-  c2_status_t Open(const V4l2EncoderSettings *encoderSettings);
+  c2_status_t Open(const V4l2EncoderSettings *encoderSettings,
+                   const V4l2DecoderSettings *decoderSettings = nullptr);
   void Close();
   c2_status_t Flush();
 

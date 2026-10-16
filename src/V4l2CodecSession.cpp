@@ -233,7 +233,8 @@ struct V4l2CodecSession::Impl {
     return C2_CORRUPTED;
   }
 
-  c2_status_t Open(const V4l2EncoderSettings *settings) {
+  c2_status_t Open(const V4l2EncoderSettings *settings,
+                   const V4l2DecoderSettings *decoderSettings) {
     Close();
     if (device_path.empty() || CompressedFormat(spec) == 0) {
       return C2_BAD_VALUE;
@@ -273,6 +274,9 @@ struct V4l2CodecSession::Impl {
       }
       return C2_OK;
     }
+    if (decoderSettings && decoderSettings->width && decoderSettings->height)
+      decoder_settings = *decoderSettings;
+
     return ConfigureDecoderOutput();
   }
 
@@ -312,8 +316,10 @@ struct V4l2CodecSession::Impl {
 
   c2_status_t Flush() {
     const std::optional<V4l2EncoderSettings> settings = encoder_settings;
+    const std::optional<V4l2DecoderSettings> decSettings = decoder_settings;
     Close();
-    return Open(settings.has_value() ? &*settings : nullptr);
+    return Open(settings.has_value() ? &*settings : nullptr,
+                decSettings.has_value() ? &*decSettings : nullptr);
   }
 
   void StreamOff(v4l2_buf_type type, bool *streaming) {
@@ -1001,9 +1007,21 @@ struct V4l2CodecSession::Impl {
       return Error("subscribing to decoder source changes");
     }
     v4l2_format codedFormat{};
+    /*
+     * Initialize the OUTPUT format with the real picture size: the
+     * firmware allocates its internal resources per session dimensions,
+     * and a mismatch with the SPS triggers a sequence change that allows
+     * only ~115ms for the capture reallocation; the zero-copy path cannot
+     * finish in time and the firmware declares SESSION_FATAL. Without a
+     * known size, fall back to the 720p limit (previous behavior).
+     */
+    const uint32_t codedWidth =
+        decoder_settings ? decoder_settings->width : 1280;
+    const uint32_t codedHeight =
+        decoder_settings ? decoder_settings->height : 720;
     c2_status_t result =
         SetFormat(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, CompressedFormat(spec),
-                  1280, 720, 0, kCompressedBufferSize, &codedFormat);
+                  codedWidth, codedHeight, 0, kCompressedBufferSize, &codedFormat);
     if (result != C2_OK) {
       return result;
     }
@@ -1404,6 +1422,7 @@ struct V4l2CodecSession::Impl {
   std::string device_path;
   android::base::unique_fd fd;
   std::optional<V4l2EncoderSettings> encoder_settings;
+  std::optional<V4l2DecoderSettings> decoder_settings;
   VulkanFrameConverter frame_converter;
 
   std::vector<EncoderInputSlot> encoder_inputs;
@@ -1439,8 +1458,10 @@ V4l2CodecSession::V4l2CodecSession(CodecSpec spec, std::string devicePath)
 
 V4l2CodecSession::~V4l2CodecSession() = default;
 
-c2_status_t V4l2CodecSession::Open(const V4l2EncoderSettings *encoderSettings) {
-  return impl_->Open(encoderSettings);
+c2_status_t V4l2CodecSession::Open(
+    const V4l2EncoderSettings *encoderSettings,
+    const V4l2DecoderSettings *decoderSettings) {
+  return impl_->Open(encoderSettings, decoderSettings);
 }
 
 void V4l2CodecSession::Close() { impl_->Close(); }

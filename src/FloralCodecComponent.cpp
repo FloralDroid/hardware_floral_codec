@@ -190,6 +190,13 @@ public:
         mRequestSync->value == C2_TRUE, mEncoderProfileLevel->profile};
   }
 
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+  V4l2DecoderSettings GetDecoderSettings() const {
+    Lock lock = this->lock();
+    return V4l2DecoderSettings{mOutputSize->width, mOutputSize->height};
+  }
+#endif
+
   void ClearSyncRequest() {
     C2StreamRequestSyncFrameTuning::output clear(0u, C2_FALSE);
     std::vector<std::unique_ptr<C2SettingResult>> failures;
@@ -1297,7 +1304,20 @@ public:
       return session_.Open(&settings);
 #endif
     }
+#if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
+    /*
+     * Defer the decoder session to the first work item: the picture size
+     * from the application configuration (mOutputSize) has arrived by
+     * then, and initializing the Venus session with the real size avoids
+     * the firmware sequence change and its ~115ms reallocation window
+     * (which the zero-copy reallocation cannot meet, so the firmware
+     * declares SESSION_FATAL).
+     */
+    decoder_session_pending_ = true;
+    return C2_OK;
+#else
     return session_.Open(nullptr);
+#endif
   }
 
   c2_status_t onStop() override {
@@ -1715,9 +1735,25 @@ private:
     }
   }
 
+  c2_status_t EnsureDecoderSession() {
+    if (!decoder_session_pending_) {
+      return C2_OK;
+    }
+    const V4l2DecoderSettings settings = interface_->GetDecoderSettings();
+    const c2_status_t result = session_.Open(nullptr, &settings);
+    if (result == C2_OK) {
+      decoder_session_pending_ = false;
+    }
+    return result;
+  }
+
   c2_status_t ProcessV4l2Decoder(const std::unique_ptr<C2Work> &work,
                                  const std::shared_ptr<C2BlockPool> &pool,
                                  bool eos) {
+    const c2_status_t openResult = EnsureDecoderSession();
+    if (openResult != C2_OK) {
+      return openResult;
+    }
     BitstreamCodec bitstreamCodec = BitstreamCodec::kAvc;
     const bool normalizeBitstream = GetDecoderBitstreamCodec(&bitstreamCodec);
     c2_status_t result = ProcessDecoderConfigUpdates(*work, bitstreamCodec,
@@ -2428,6 +2464,7 @@ private:
 #if defined(FLORAL_CODEC_BACKEND_V4L2_M2M)
   V4l2CodecSession session_;
   std::shared_ptr<C2BlockPool> encoder_graphic_pool_;
+  bool decoder_session_pending_ = false;
 #else
   FfmpegSession session_;
 #endif
