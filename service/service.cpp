@@ -17,6 +17,7 @@
 #define LOG_TAG "android.hardware.media.c2@1.2-service-floral"
 
 #include "floral/codec/FloralCodecStore.h"
+#include "SandboxMode.h"
 
 #include <binder/ProcessState.h>
 #include <codec2/hidl/1.2/ComponentStore.h>
@@ -30,6 +31,9 @@ int main() {
   using ::android::hardware::media::c2::V1_2::utils::ComponentStore;
 
   signal(SIGPIPE, SIG_IGN);
+  if (!floral::codec::SetUpServiceSandbox()) {
+    return 1;
+  }
   ::android::ProcessState::initWithDriver("/dev/vndbinder");
   ::android::ProcessState::self()->startThreadPool();
   ::android::hardware::configureRpcThreadpool(8, true);
