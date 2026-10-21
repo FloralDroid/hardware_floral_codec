@@ -21,6 +21,7 @@
 #include "floral/codec/MinigbmDmaBuf.h"
 #include "floral/codec/VulkanFrameConverter.h"
 
+#include "V4l2DecoderGeometry.h"
 #include "V4l2EncoderMetadata.h"
 
 #include <C2AllocatorGralloc.h>
@@ -332,6 +333,8 @@ struct V4l2CodecSession::Impl {
     capture_height = 0;
     visible_width = 0;
     visible_height = 0;
+    decoder_visible_left = 0;
+    decoder_visible_top = 0;
   }
 
   c2_status_t Flush() {
@@ -1149,34 +1152,29 @@ struct V4l2CodecSession::Impl {
 
   c2_status_t BeginDecoderCaptureSetup() {
     ResetDecoderCapture();
-    v4l2_format format{};
-    format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    if (Ioctl(fd.get(), VIDIOC_G_FMT, &format) < 0) {
-      return Error("querying decoder capture format");
+    V4l2DecoderCaptureGeometry geometry;
+    if (NegotiateV4l2DecoderCapture(
+            [this](unsigned long request, void *argument) {
+              return Ioctl(fd.get(), request, argument);
+            },
+            &geometry) < 0) {
+      return errno == ENOTSUP ? C2_OMITTED
+                             : Error("negotiating decoder capture geometry");
     }
-    const uint32_t decodedWidth = format.fmt.pix_mp.width;
-    const uint32_t decodedHeight = format.fmt.pix_mp.height;
-    c2_status_t result =
-        SetFormat(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, V4L2_PIX_FMT_NV12,
-                  decodedWidth, decodedHeight, 0, 0, &format);
-    if (result != C2_OK) {
-      return result;
-    }
+    const auto &format = geometry.format;
     capture_width = format.fmt.pix_mp.width;
     capture_height = format.fmt.pix_mp.height;
     raw_stride = format.fmt.pix_mp.plane_fmt[0].bytesperline;
     raw_size = format.fmt.pix_mp.plane_fmt[0].sizeimage;
-    visible_width = capture_width;
-    visible_height = capture_height;
-
-    v4l2_selection selection{};
-    selection.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    selection.target = V4L2_SEL_TGT_COMPOSE;
-    if (Ioctl(fd.get(), VIDIOC_G_SELECTION, &selection) == 0 &&
-        selection.r.width > 0 && selection.r.height > 0) {
-      visible_width = std::min<uint32_t>(selection.r.width, capture_width);
-      visible_height = std::min<uint32_t>(selection.r.height, capture_height);
-    }
+    visible_width = geometry.visible.width;
+    visible_height = geometry.visible.height;
+    decoder_visible_left = static_cast<uint32_t>(geometry.visible.left);
+    decoder_visible_top = static_cast<uint32_t>(geometry.visible.top);
+    ALOGI("decoder layout on %s: capture=%ux%u stride=%u size=%u "
+          "visible=%ux%u+%u+%u",
+          device_path.c_str(), capture_width, capture_height, raw_stride,
+          raw_size, visible_width, visible_height, decoder_visible_left,
+          decoder_visible_top);
 
     uint32_t minimum = 4;
     v4l2_control control{};
@@ -1185,7 +1183,7 @@ struct V4l2CodecSession::Impl {
       minimum = static_cast<uint32_t>(control.value);
     }
     uint32_t count = 0;
-    result =
+    c2_status_t result =
         RequestBuffers(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, V4L2_MEMORY_DMABUF,
                        minimum + kDecoderCaptureSlack, &count);
     if (result != C2_OK) {
@@ -1341,6 +1339,8 @@ struct V4l2CodecSession::Impl {
       frame.frame_index = TimestampToFrameIndex(buffer.timestamp);
       frame.width = visible_width;
       frame.height = visible_height;
+      frame.crop_left = decoder_visible_left;
+      frame.crop_top = decoder_visible_top;
       frame.end_of_stream = (buffer.flags & V4L2_BUF_FLAG_LAST) != 0;
       decoder_capture[buffer.index].queued = false;
       if (plane.bytesused != 0) {
@@ -1486,6 +1486,8 @@ struct V4l2CodecSession::Impl {
   uint32_t capture_height = 0;
   uint32_t visible_width = 0;
   uint32_t visible_height = 0;
+  uint32_t decoder_visible_left = 0;
+  uint32_t decoder_visible_top = 0;
 };
 
 V4l2CodecSession::V4l2CodecSession(CodecSpec spec, std::string devicePath)

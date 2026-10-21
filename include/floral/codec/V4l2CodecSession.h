@@ -63,6 +63,8 @@ struct V4l2DecodedFrame {
   uint64_t frame_index = 0;
   uint32_t width = 0;
   uint32_t height = 0;
+  uint32_t crop_left = 0;
+  uint32_t crop_top = 0;
   bool end_of_stream = false;
 };
 

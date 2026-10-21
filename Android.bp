@@ -97,6 +97,7 @@ cc_test_host {
         "tests/BitstreamUtilsTest.cpp",
         "tests/H264LevelTest.cpp",
         "tests/V4l2EncoderMetadataTest.cpp",
+        "tests/V4l2DecoderGeometryTest.cpp",
     ],
     local_include_dirs: ["include", "src"],
     static_libs: ["libgtest", "libgtest_main"],
