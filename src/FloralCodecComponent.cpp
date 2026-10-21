@@ -1678,7 +1678,9 @@ private:
         return result;
       }
       std::shared_ptr<C2Buffer> buffer = C2Buffer::CreateGraphicBuffer(
-          frame.block->share(C2Rect(frame.width, frame.height), C2Fence()));
+          frame.block->share(C2Rect(frame.width, frame.height)
+                                 .at(frame.crop_left, frame.crop_top),
+                             C2Fence()));
       if (hasPending) {
         FinishOutput(pending.frame_index, currentWork, pending.buffer,
                      std::move(pending.updates), C2FrameData::flags_t(0));
