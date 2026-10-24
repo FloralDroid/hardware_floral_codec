@@ -15,6 +15,7 @@
  */
 
 #define LOG_TAG "FloralV4l2Codec"
+#define ATRACE_TAG (ATRACE_TAG_VIDEO | ATRACE_TAG_HAL)
 
 #include "floral/codec/V4l2CodecSession.h"
 
@@ -33,6 +34,7 @@
 #include <hardware/gralloc1.h>
 #include <linux/videodev2.h>
 #include <log/log.h>
+#include <utils/Trace.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -187,6 +189,9 @@ struct MappedBuffer {
 };
 
 bool SameDmaBufObject(int first, int second) {
+  if (first == second && first >= 0) {
+    return true;
+  }
   struct stat firstStat {};
   struct stat secondStat {};
   return fstat(first, &firstStat) == 0 && fstat(second, &secondStat) == 0 &&
@@ -217,21 +222,17 @@ void LogDmaBufLayout(const char *name, const MinigbmDmaBuf &buffer) {
 
 } // namespace
 
-namespace {
-// Timing diagnostic: log each stage of the encoder input queue path.
-void EncQueuePhase(const char *phase) {
-  ALOGI("FloralV4l2Codec: encq %s t=%lld", phase,
-        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
-}
-}  // namespace
-
 struct V4l2CodecSession::Impl {
   struct EncoderInputSlot {
     std::shared_ptr<C2Buffer> owner;
     std::shared_ptr<C2GraphicBlock> converted_block;
     bool queued = false;
+  };
+
+  struct PendingEncoderFrame {
+    V4l2EncodedFrame frame;
+    uint32_t capture_index = 0;
+    uint32_t data_offset = 0;
   };
 
   struct DecoderInputSlot {
@@ -818,6 +819,7 @@ struct V4l2CodecSession::Impl {
   }
 
   c2_status_t PumpEncoderCapture() {
+    ATRACE_NAME("floral.encoder.capture");
     while (true) {
       v4l2_plane plane{};
       v4l2_buffer buffer{};
@@ -831,13 +833,17 @@ struct V4l2CodecSession::Impl {
                    : Error("dequeueing encoder output");
       }
       if (buffer.index >= capture_mmaps.size() ||
-          plane.data_offset > capture_mmaps[buffer.index].length ||
-          plane.bytesused >
-              capture_mmaps[buffer.index].length - plane.data_offset) {
+          plane.bytesused > capture_mmaps[buffer.index].length ||
+          plane.data_offset > plane.bytesused) {
         return C2_CORRUPTED;
       }
-      V4l2EncodedFrame frame;
-      if (plane.bytesused != 0) {
+      PendingEncoderFrame pending;
+      pending.capture_index = buffer.index;
+      pending.data_offset = plane.data_offset;
+      V4l2EncodedFrame &frame = pending.frame;
+      // Multi-planar bytesused includes data_offset, not just the payload.
+      frame.size = plane.bytesused - plane.data_offset;
+      if (frame.size != 0) {
         const std::optional<uint64_t> frameIndex = TakeV4l2EncoderFrameIndex(
             &encoder_frame_metadata, buffer.timestamp);
         if (!frameIndex.has_value()) {
@@ -851,14 +857,12 @@ struct V4l2CodecSession::Impl {
       }
       frame.key_frame = (buffer.flags & V4L2_BUF_FLAG_KEYFRAME) != 0;
       frame.end_of_stream = (buffer.flags & V4L2_BUF_FLAG_LAST) != 0;
-      const auto *begin =
-          static_cast<const uint8_t *>(capture_mmaps[buffer.index].address) +
-          plane.data_offset;
-      frame.data.assign(begin, begin + plane.bytesused);
-      if (!frame.data.empty() || frame.end_of_stream) {
-        encoder_pending.push_back(std::move(frame));
-      }
-      if ((buffer.flags & V4L2_BUF_FLAG_LAST) == 0) {
+      if (frame.size != 0 || frame.end_of_stream) {
+        // Keep this MMAP slot dequeued until its payload has been copied
+        // directly into a Codec2 block. The capture queue bounds storage;
+        // no intermediate bitstream vector or unbounded heap queue is needed.
+        encoder_pending.push_back(std::move(pending));
+      } else {
         c2_status_t result = QueueMmapCapture(buffer.index);
         if (result != C2_OK) {
           return result;
@@ -893,6 +897,7 @@ struct V4l2CodecSession::Impl {
       const std::shared_ptr<C2BlockPool> &conversionPool,
       const std::shared_ptr<C2Buffer> &owner, uint64_t frameIndex,
       int64_t timestampUs, bool requestSync, uint32_t bitrate) {
+    ATRACE_NAME("floral.encoder.queue");
     if (owner == nullptr || owner->data().type() != C2BufferData::GRAPHIC ||
         !encoder_settings.has_value()) {
       return C2_BAD_VALUE;
@@ -908,13 +913,55 @@ struct V4l2CodecSession::Impl {
       return C2_BAD_VALUE;
     }
     const C2ConstGraphicBlock &block = graphicBlocks.front();
-    EncQueuePhase("fence_wait");
-    c2_status_t result = block.fence().wait(kFenceTimeoutNs);
+    c2_status_t result = C2_OK;
+    auto freeSlot = encoder_inputs.end();
+    if (encoder_configured) {
+      // Check backpressure before waiting on or converting a new RGB frame.
+      // A C2_BLOCKING retry must not repeat a full GPU conversion.
+      result = PumpEncoder();
+      if (result != C2_OK) {
+        return result;
+      }
+      freeSlot = std::find_if(
+          encoder_inputs.begin(), encoder_inputs.end(),
+          [](const EncoderInputSlot &slot) { return !slot.queued; });
+      if (freeSlot == encoder_inputs.end() ||
+          encoder_frame_metadata.size() >= encoder_inputs.size()) {
+        // Dequeued capture slots are held until the caller drains them.
+        // Do not poll a stalled device while that caller could free slots.
+        if (!encoder_pending.empty()) {
+          return C2_BLOCKING;
+        }
+        ATRACE_NAME("floral.encoder.input_slot_wait");
+        result = WaitForDevice(
+            encoder_frame_metadata.size() >= encoder_inputs.size()
+                ? POLLIN
+                : POLLIN | POLLOUT,
+            kEncoderInputWaitMs);
+        if (result != C2_OK) {
+          return result;
+        }
+        result = PumpEncoder();
+        if (result != C2_OK) {
+          return result;
+        }
+        freeSlot = std::find_if(
+            encoder_inputs.begin(), encoder_inputs.end(),
+            [](const EncoderInputSlot &slot) { return !slot.queued; });
+        if (freeSlot == encoder_inputs.end() ||
+            encoder_frame_metadata.size() >= encoder_inputs.size()) {
+          return C2_BLOCKING;
+        }
+      }
+    }
+    {
+      ATRACE_NAME("floral.encoder.input_fence");
+      result = block.fence().wait(kFenceTimeoutNs);
+    }
     if (result != C2_OK) {
       ALOGE("waiting for encoder input fence failed: %d", result);
       return result;
     }
-    EncQueuePhase("fence_ok");
 
     NativeHandle handle(
         android::UnwrapNativeCodec2GrallocHandle(block.handle()));
@@ -927,6 +974,11 @@ struct V4l2CodecSession::Impl {
     }
     std::shared_ptr<C2GraphicBlock> convertedBlock;
     if (!IsLinearNv12(dmaBuf)) {
+      const MinigbmDmaBuf source = dmaBuf;
+      if (block.width() != source.width || block.height() != source.height) {
+        ALOGE("RGB graphic block dimensions do not match its DMA-BUF");
+        return C2_OMITTED;
+      }
       if (conversionPool == nullptr) {
         return C2_NO_INIT;
       }
@@ -957,9 +1009,7 @@ struct V4l2CodecSession::Impl {
         LogDmaBufLayout("pooled encoder input", dmaBuf);
         return C2_OMITTED;
       }
-      EncQueuePhase("convert_begin");
-      result = frame_converter.Convert(block, dmaBuf);
-      EncQueuePhase("convert_done");
+      result = frame_converter.Convert(source, dmaBuf);
       if (result != C2_OK) {
         return result;
       }
@@ -970,45 +1020,15 @@ struct V4l2CodecSession::Impl {
       if (result != C2_OK) {
         return result;
       }
+      // ConfigureEncoder allocated an entirely new, empty input queue.
+      freeSlot = encoder_inputs.begin();
     }
-    if (!IsLinearNv12(dmaBuf) || dmaBuf.planes[0].stride != raw_stride ||
+    // Both the direct and converted paths already checked the NV12 object
+    // identity above. Only the negotiated layout needs checking again here.
+    if (dmaBuf.planes[0].stride != raw_stride ||
         dmaBuf.total_size < raw_size) {
       ALOGE("encoder input DMA-BUF layout changed after configuration");
       return C2_BAD_VALUE;
-    }
-
-    EncQueuePhase("pump_begin");
-    result = PumpEncoder();
-    if (result != C2_OK) {
-      return result;
-    }
-    EncQueuePhase("pump_done");
-    auto freeSlot =
-        std::find_if(encoder_inputs.begin(), encoder_inputs.end(),
-                     [](const EncoderInputSlot &slot) { return !slot.queued; });
-    if (freeSlot == encoder_inputs.end() ||
-        encoder_frame_metadata.size() >= encoder_inputs.size()) {
-      EncQueuePhase("waitdev_begin");
-      result = WaitForDevice(
-          encoder_frame_metadata.size() >= encoder_inputs.size()
-              ? POLLIN
-              : POLLIN | POLLOUT,
-          kEncoderInputWaitMs);
-      if (result != C2_OK) {
-        return result;
-      }
-      result = PumpEncoder();
-      if (result != C2_OK) {
-        return result;
-      }
-      EncQueuePhase("waitdev_done");
-      freeSlot = std::find_if(
-          encoder_inputs.begin(), encoder_inputs.end(),
-          [](const EncoderInputSlot &slot) { return !slot.queued; });
-      if (freeSlot == encoder_inputs.end() ||
-          encoder_frame_metadata.size() >= encoder_inputs.size()) {
-        return C2_BLOCKING;
-      }
     }
 
     if (bitrate != current_bitrate) {
@@ -1037,11 +1057,12 @@ struct V4l2CodecSession::Impl {
     buffer.length = 1;
     buffer.m.planes = &plane;
     buffer.timestamp = timestamp;
-    EncQueuePhase("qbuf_begin");
-    if (Ioctl(fd.get(), VIDIOC_QBUF, &buffer) < 0) {
-      return Error("queueing zero-copy encoder input");
+    {
+      ATRACE_NAME("floral.encoder.qbuf");
+      if (Ioctl(fd.get(), VIDIOC_QBUF, &buffer) < 0) {
+        return Error("queueing zero-copy encoder input");
+      }
     }
-    EncQueuePhase("qbuf_done");
     // Input DQBUF releases the image, but the work index must survive until
     // capture DQBUF. Storage is bounded by the input queue and preallocated.
     encoder_frame_metadata.push_back({timestamp, frameIndex});
@@ -1054,14 +1075,62 @@ struct V4l2CodecSession::Impl {
     return C2_OK;
   }
 
-  c2_status_t DequeueEncoderFrame(V4l2EncodedFrame *output, bool wait) {
+  c2_status_t CopyEncoderFrame(const std::shared_ptr<C2BlockPool> &pool,
+                              V4l2EncodedFrame *output) {
+    ATRACE_NAME("floral.encoder.output");
+    const PendingEncoderFrame &pending = encoder_pending.front();
+    std::shared_ptr<C2LinearBlock> block;
+    if (pending.frame.size != 0) {
+      if (pool == nullptr) {
+        return C2_NO_INIT;
+      }
+      {
+        ATRACE_NAME("floral.encoder.output_allocate");
+        const C2MemoryUsage usage = {C2MemoryUsage::CPU_READ,
+                                     C2MemoryUsage::CPU_WRITE};
+        c2_status_t result =
+            pool->fetchLinearBlock(pending.frame.size, usage, &block);
+        if (result != C2_OK) {
+          return result;
+        }
+      }
+      C2WriteView view = block->map().get();
+      if (view.error() != C2_OK) {
+        return view.error();
+      }
+      if (view.capacity() < pending.frame.size) {
+        return C2_CORRUPTED;
+      }
+      const auto *begin = static_cast<const uint8_t *>(
+                              capture_mmaps[pending.capture_index].address) +
+                          pending.data_offset;
+      {
+        ATRACE_NAME("floral.encoder.bitstream_copy");
+        std::memcpy(view.data(), begin, pending.frame.size);
+      }
+      ATRACE_INT64("floral.encoder.output_bytes", pending.frame.size);
+    }
+    // Allocation/map errors leave the front entry and its capture slot
+    // intact, so a caller retry cannot lose a frame or read a recycled slot.
+    if (!pending.frame.end_of_stream) {
+      c2_status_t result = QueueMmapCapture(pending.capture_index);
+      if (result != C2_OK) {
+        return result;
+      }
+    }
+    *output = std::move(encoder_pending.front().frame);
+    output->block = std::move(block);
+    encoder_pending.pop_front();
+    return C2_OK;
+  }
+
+  c2_status_t DequeueEncoderFrame(const std::shared_ptr<C2BlockPool> &pool,
+                                 V4l2EncodedFrame *output, bool wait) {
     if (output == nullptr) {
       return C2_BAD_VALUE;
     }
     if (!encoder_pending.empty()) {
-      *output = std::move(encoder_pending.front());
-      encoder_pending.pop_front();
-      return C2_OK;
+      return CopyEncoderFrame(pool, output);
     }
     if (!encoder_configured) {
       return C2_NOT_FOUND;
@@ -1083,9 +1152,7 @@ struct V4l2CodecSession::Impl {
     if (encoder_pending.empty()) {
       return C2_NOT_FOUND;
     }
-    *output = std::move(encoder_pending.front());
-    encoder_pending.pop_front();
-    return C2_OK;
+    return CopyEncoderFrame(pool, output);
   }
 
   c2_status_t StartEncoderDrain() {
@@ -1093,9 +1160,9 @@ struct V4l2CodecSession::Impl {
       return C2_OK;
     }
     if (!encoder_configured) {
-      V4l2EncodedFrame frame;
-      frame.end_of_stream = true;
-      encoder_pending.push_back(std::move(frame));
+      PendingEncoderFrame pending;
+      pending.frame.end_of_stream = true;
+      encoder_pending.push_back(std::move(pending));
       draining = true;
       return C2_OK;
     }
@@ -1536,7 +1603,7 @@ struct V4l2CodecSession::Impl {
   std::vector<DecoderCaptureSlot> decoder_capture;
   std::vector<MappedBuffer> output_mmaps;
   std::vector<MappedBuffer> capture_mmaps;
-  std::deque<V4l2EncodedFrame> encoder_pending;
+  std::deque<PendingEncoderFrame> encoder_pending;
   std::deque<V4l2DecodedFrame> decoder_pending;
 
   bool encoder_configured = false;
@@ -1585,9 +1652,9 @@ V4l2CodecSession::QueueEncoderFrame(
                                   timestampUs, requestSync, bitrate);
 }
 
-c2_status_t V4l2CodecSession::DequeueEncoderFrame(V4l2EncodedFrame *output,
-                                                  bool wait) {
-  return impl_->DequeueEncoderFrame(output, wait);
+c2_status_t V4l2CodecSession::DequeueEncoderFrame(
+    const std::shared_ptr<C2BlockPool> &pool, V4l2EncodedFrame *output, bool wait) {
+  return impl_->DequeueEncoderFrame(pool, output, wait);
 }
 
 c2_status_t V4l2CodecSession::StartEncoderDrain() {

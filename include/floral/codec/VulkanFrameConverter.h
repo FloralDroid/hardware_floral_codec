@@ -36,7 +36,9 @@ public:
   VulkanFrameConverter &operator=(const VulkanFrameConverter &) = delete;
 
   c2_status_t Initialize();
-  c2_status_t Convert(const C2ConstGraphicBlock &source,
+  // Descriptions borrow their FDs; the caller keeps both C2 blocks alive
+  // until this synchronous conversion has finished.
+  c2_status_t Convert(const MinigbmDmaBuf &source,
                       const MinigbmDmaBuf &destination);
   void Reset();
 
