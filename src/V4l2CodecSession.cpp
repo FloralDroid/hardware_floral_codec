@@ -324,6 +324,7 @@ struct V4l2CodecSession::Impl {
     draining = false;
     decoder_received_input = false;
     current_bitrate = 0;
+    effective_bitrate = 0;
     encoder_peak_bitrate = 0;
     venus_encoder = false;
     raw_size = 0;
@@ -480,36 +481,103 @@ struct V4l2CodecSession::Impl {
     return C2_OK;
   }
 
+  // Integer bitrate controls may be rounded to a legal step or clamped to
+  // the driver's range. For example, upstream Venus uses a 32000 bit/s
+  // minimum and a 100 bit/s step: 31900 is clamped, while 1000049 is rounded.
+  // Accept a positive readback after a successful write, but still propagate
+  // unsupported controls and ioctl failures. Profile/level remain strict.
+  c2_status_t ApplyBitrateControl(uint32_t id, int32_t value,
+                                 int32_t *effective) {
+    if (effective == nullptr) {
+      return C2_BAD_VALUE;
+    }
+    c2_status_t result = SetControl(id, value, true);
+    if (result != C2_OK) {
+      return result;
+    }
+    v4l2_control control{};
+    control.id = id;
+    if (Ioctl(fd.get(), VIDIOC_G_CTRL, &control) < 0) {
+      return Error("reading back V4L2 control");
+    }
+    if (control.value <= 0) {
+      ALOGE("%s returned invalid bitrate control %#x value %d",
+            device_path.c_str(), id, control.value);
+      return C2_CORRUPTED;
+    }
+    *effective = control.value;
+    if (control.value != value) {
+      ALOGI("%s adjusted V4L2 control %#x from %d to %d",
+            device_path.c_str(), id, value, control.value);
+    }
+    return C2_OK;
+  }
+
   c2_status_t SetEncoderBitrate(uint32_t bitrate) {
     if (bitrate == 0 ||
         bitrate > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
       return C2_BAD_VALUE;
     }
-    // Venus only applies BITRATE_PEAK at STREAMON. Do not pretend that a
-    // successful runtime S_CTRL/G_CTRL also updates the firmware's limit.
-    if (venus_encoder && encoder_configured && bitrate > encoder_peak_bitrate) {
-      ALOGE("encoder target %u exceeds the configured Venus peak %u",
-            bitrate, encoder_peak_bitrate);
-      return C2_BAD_VALUE;
+    int32_t targetBitrate = static_cast<int32_t>(bitrate);
+    if (venus_encoder && encoder_configured) {
+      // Venus applies BITRATE_PEAK only at STREAMON. Normalize the target
+      // without changing the running session before comparing it to that
+      // fixed limit: e.g. 1000049 may still mean a legal 1000000 bit/s.
+      v4l2_ext_control target{};
+      target.id = V4L2_CID_MPEG_VIDEO_BITRATE;
+      target.value = targetBitrate;
+      v4l2_ext_controls controls{};
+      controls.which = V4L2_CTRL_WHICH_CUR_VAL;
+      controls.count = 1;
+      controls.controls = &target;
+      if (Ioctl(fd.get(), VIDIOC_TRY_EXT_CTRLS, &controls) < 0) {
+        return Error("trying V4L2 encoder bitrate");
+      }
+      if (target.value <= 0 ||
+          static_cast<uint32_t>(target.value) > encoder_peak_bitrate) {
+        ALOGE("encoder target %u (normalized %d) exceeds the configured "
+              "Venus peak %u or is invalid",
+              bitrate, target.value, encoder_peak_bitrate);
+        return C2_BAD_VALUE;
+      }
+      targetBitrate = target.value;
     }
-    c2_status_t result = SetAndVerifyControl(
-        V4L2_CID_MPEG_VIDEO_BITRATE, static_cast<int32_t>(bitrate));
+    int32_t effectiveBitrate = 0;
+    c2_status_t result = ApplyBitrateControl(V4L2_CID_MPEG_VIDEO_BITRATE,
+                                            targetBitrate, &effectiveBitrate);
     if (result != C2_OK) {
       return result;
     }
+    if (venus_encoder && encoder_configured &&
+        static_cast<uint32_t>(effectiveBitrate) > encoder_peak_bitrate) {
+      ALOGE("%s stored bitrate %d above the configured Venus peak %u",
+            device_path.c_str(), effectiveBitrate, encoder_peak_bitrate);
+      return C2_CORRUPTED;
+    }
     if (venus_encoder && !encoder_configured) {
       // The driver default is a fixed 2 Mbps, not a limit derived from the
-      // requested target. Use the negotiated bitrate so both agree with SPS.
-      result = SetAndVerifyControl(V4L2_CID_MPEG_VIDEO_BITRATE_PEAK,
-                                   static_cast<int32_t>(bitrate));
+      // requested target. Set the peak from the accepted target and use the
+      // stored peak as the runtime limit and H.264 level's bitrate bound.
+      int32_t effectivePeak = 0;
+      result = ApplyBitrateControl(V4L2_CID_MPEG_VIDEO_BITRATE_PEAK,
+                                   effectiveBitrate, &effectivePeak);
       if (result != C2_OK) {
         return result;
       }
-      encoder_peak_bitrate = bitrate;
-      ALOGI("Venus encoder bitrate on %s: target=%u peak=%u",
-            device_path.c_str(), bitrate, encoder_peak_bitrate);
+      if (effectivePeak < effectiveBitrate) {
+        ALOGE("%s stored Venus peak %d below target %d",
+              device_path.c_str(), effectivePeak, effectiveBitrate);
+        return C2_BAD_VALUE;
+      }
+      encoder_peak_bitrate = static_cast<uint32_t>(effectivePeak);
+      ALOGI("Venus encoder bitrate on %s: requested=%u target=%d peak=%u",
+            device_path.c_str(), bitrate, effectiveBitrate,
+            encoder_peak_bitrate);
     }
+    // Cache the request separately so a rounded value does not cause the
+    // same control to be written again for every input frame.
     current_bitrate = bitrate;
+    effective_bitrate = static_cast<uint32_t>(effectiveBitrate);
     return C2_OK;
   }
 
@@ -648,13 +716,15 @@ struct V4l2CodecSession::Impl {
       const uint32_t codedHeight =
           std::max({encoder_settings->height, rawFormat.fmt.pix_mp.height,
                     codedFormat.fmt.pix_mp.height});
+      const uint32_t bitrateBound =
+          std::max(effective_bitrate, encoder_peak_bitrate);
       const std::optional<H264Level> level = FindMinimumH264Level(
           codedWidth, codedHeight, encoder_settings->frame_rate,
-          encoder_settings->bitrate, encoder_settings->h264_profile);
+          bitrateBound, encoder_settings->h264_profile);
       if (!level.has_value()) {
         ALOGE("no H.264 level through 5.2 covers %ux%u@%u and %u bps",
               codedWidth, codedHeight, encoder_settings->frame_rate,
-              encoder_settings->bitrate);
+              bitrateBound);
         return C2_BAD_VALUE;
       }
       result = SetAndVerifyControl(
@@ -1478,6 +1548,7 @@ struct V4l2CodecSession::Impl {
   bool draining = false;
   bool decoder_received_input = false;
   uint32_t current_bitrate = 0;
+  uint32_t effective_bitrate = 0;
   uint32_t encoder_peak_bitrate = 0;
   uint32_t raw_size = 0;
   uint32_t raw_stride = 0;
