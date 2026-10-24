@@ -15,15 +15,16 @@
  */
 
 #define LOG_TAG "FloralCodec2Vulkan"
+#define ATRACE_TAG (ATRACE_TAG_VIDEO | ATRACE_TAG_HAL)
 
 #include "floral/codec/VulkanFrameConverter.h"
 
 #include "RgbToNv12Shader.h"
 
-#include <C2AllocatorGralloc.h>
 #include <android-base/unique_fd.h>
 #include <drm_fourcc.h>
 #include <log/log.h>
+#include <utils/Trace.h>
 #include <vulkan/vulkan.h>
 
 #include <sys/stat.h>
@@ -86,16 +87,6 @@ BufferSignature MakeBufferSignature(const MinigbmDmaBuf &buffer) {
   return signature;
 }
 
-struct NativeHandleDeleter {
-  void operator()(native_handle_t *handle) const {
-    if (handle != nullptr) {
-      native_handle_delete(handle);
-    }
-  }
-};
-
-using NativeHandle = std::unique_ptr<native_handle_t, NativeHandleDeleter>;
-
 bool IsRgbFormat(uint32_t format) {
   switch (format) {
   case DRM_FORMAT_ABGR8888:
@@ -125,6 +116,9 @@ VkFormat VulkanFormatForDrm(uint32_t format) {
 }
 
 bool SameDmaBufObject(int first, int second) {
+  if (first == second && first >= 0) {
+    return true;
+  }
   struct stat firstStat {};
   struct stat secondStat {};
   return fstat(first, &firstStat) == 0 && fstat(second, &secondStat) == 0 &&
@@ -346,7 +340,6 @@ public:
     sampler_ = VK_NULL_HANDLE;
     descriptor_set_layout_ = VK_NULL_HANDLE;
     descriptor_pool_ = VK_NULL_HANDLE;
-    descriptor_set_ = VK_NULL_HANDLE;
     pipeline_layout_ = VK_NULL_HANDLE;
     pipeline_ = VK_NULL_HANDLE;
     command_pool_ = VK_NULL_HANDLE;
@@ -360,18 +353,14 @@ public:
     destination_cache_misses_ = 0;
   }
 
-  c2_status_t Convert(const C2ConstGraphicBlock &source,
+  c2_status_t Convert(const MinigbmDmaBuf &source,
                       const MinigbmDmaBuf &destination) {
+    ATRACE_NAME("floral.encoder.convert");
     if (Initialize() != C2_OK) {
       return C2_OMITTED;
     }
-    NativeHandle handle(
-        android::UnwrapNativeCodec2GrallocHandle(source.handle()));
-    MinigbmDmaBuf input;
-    if (handle == nullptr ||
-        !GetMinigbmDmaBuf(handle.get(), source.width(), source.height(),
-                          &input) ||
-        !IsRgbFormat(input.drm_format) || input.plane_count != 1) {
+    if (!IsRgbFormat(source.drm_format) || source.plane_count != 1 ||
+        source.planes[0].fd < 0 || source.width == 0 || source.height == 0) {
       ALOGE("Vulkan conversion requires a single-plane RGB minigbm input");
       return C2_OMITTED;
     }
@@ -381,7 +370,7 @@ public:
 
     SourceResource *sourceResource = nullptr;
     DestinationResource *destinationResource = nullptr;
-    c2_status_t result = GetSourceResource(input, &sourceResource);
+    c2_status_t result = GetSourceResource(source, &sourceResource);
     if (result != C2_OK) {
       return result;
     }
@@ -390,30 +379,24 @@ public:
       return result;
     }
 
-    VkDescriptorImageInfo sourceDescriptor{};
-    sourceDescriptor.sampler = sampler_;
-    sourceDescriptor.imageView = sourceResource->view;
-    sourceDescriptor.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    std::array<VkWriteDescriptorSet, 3> writes{};
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = descriptor_set_;
-    writes[0].dstBinding = 0;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[0].pImageInfo = &sourceDescriptor;
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = descriptor_set_;
-    writes[1].dstBinding = 1;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
-    writes[1].pTexelBufferView = &destinationResource->y_view;
-    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[2].dstSet = descriptor_set_;
-    writes[2].dstBinding = 2;
-    writes[2].descriptorCount = 1;
-    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
-    writes[2].pTexelBufferView = &destinationResource->uv_view;
-    vkUpdateDescriptorSets(device_, writes.size(), writes.data(), 0, nullptr);
+    // NV12 plane bindings are immutable for the lifetime of a destination
+    // cache entry. Only update the RGB binding when its import changes.
+    // A generation, not a VkImageView value, detects recycled Vulkan handles.
+    if (destinationResource->source_generation != sourceResource->generation) {
+      VkDescriptorImageInfo sourceDescriptor{};
+      sourceDescriptor.sampler = sampler_;
+      sourceDescriptor.imageView = sourceResource->view;
+      sourceDescriptor.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      VkWriteDescriptorSet write{};
+      write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      write.dstSet = destinationResource->descriptor_set;
+      write.dstBinding = 0;
+      write.descriptorCount = 1;
+      write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      write.pImageInfo = &sourceDescriptor;
+      vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+      destinationResource->source_generation = sourceResource->generation;
+    }
 
     return Dispatch(*sourceResource, *destinationResource, destination);
   }
@@ -426,6 +409,7 @@ private:
     VkImageView view = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
     uint64_t last_used = 0;
+    uint64_t generation = 0;
   };
 
   struct DestinationResource {
@@ -434,6 +418,8 @@ private:
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkBufferView y_view = VK_NULL_HANDLE;
     VkBufferView uv_view = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    uint64_t source_generation = 0;
     uint64_t last_used = 0;
   };
 
@@ -483,12 +469,14 @@ private:
     }
 
     const std::array<VkDescriptorPoolSize, 2> poolSizes = {{
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 2},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kDestinationCacheCapacity},
+        {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
+         2 * kDestinationCacheCapacity},
     }};
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 1;
+    poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    poolInfo.maxSets = kDestinationCacheCapacity;
     poolInfo.poolSizeCount = poolSizes.size();
     poolInfo.pPoolSizes = poolSizes.data();
     if (!Check(vkCreateDescriptorPool(device_, &poolInfo, nullptr,
@@ -496,17 +484,6 @@ private:
                "creating the conversion descriptor pool")) {
       return false;
     }
-    VkDescriptorSetAllocateInfo allocateInfo{};
-    allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocateInfo.descriptorPool = descriptor_pool_;
-    allocateInfo.descriptorSetCount = 1;
-    allocateInfo.pSetLayouts = &descriptor_set_layout_;
-    if (!Check(
-            vkAllocateDescriptorSets(device_, &allocateInfo, &descriptor_set_),
-            "allocating the conversion descriptor set")) {
-      return false;
-    }
-
     VkPushConstantRange pushConstants{};
     pushConstants.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushConstants.size = sizeof(ConversionParameters);
@@ -571,16 +548,15 @@ private:
                  "creating the conversion fence");
   }
 
-  bool ValidateDestination(const C2ConstGraphicBlock &source,
+  bool ValidateDestination(const MinigbmDmaBuf &source,
                            const MinigbmDmaBuf &destination) const {
     if (destination.drm_format != DRM_FORMAT_NV12 ||
         destination.modifier != DRM_FORMAT_MOD_LINEAR ||
-        destination.plane_count != 2 || source.width() != destination.width ||
-        source.height() != destination.height ||
+        destination.plane_count != 2 || source.width != destination.width ||
+        source.height != destination.height ||
         (destination.width & 1u) != 0 || (destination.height & 1u) != 0 ||
         destination.planes[0].stride != destination.planes[1].stride ||
-        (destination.planes[1].stride & 1u) != 0 ||
-        !SameDmaBufObject(destination.planes[0].fd, destination.planes[1].fd)) {
+        (destination.planes[1].stride & 1u) != 0) {
       ALOGE("Vulkan conversion requires one linear, even-sized NV12 DMA-BUF");
       return false;
     }
@@ -624,6 +600,7 @@ private:
     (void)unused;
     inserted->second.signature = signature;
     inserted->second.last_used = ++cache_use_counter_;
+    inserted->second.generation = inserted->second.last_used;
     ++source_cache_misses_;
     const c2_status_t result = ImportSource(input, &inserted->second);
     if (result != C2_OK) {
@@ -814,6 +791,13 @@ private:
 
   c2_status_t ImportDestination(const MinigbmDmaBuf &destination,
                                 DestinationResource *resource) {
+    // Check object identity once per import, rather than on every cache hit.
+    // The session also validates it before queueing NV12 to the encoder.
+    if (!SameDmaBufObject(destination.planes[0].fd,
+                          destination.planes[1].fd)) {
+      ALOGE("Vulkan NV12 planes must reference the same DMA-BUF object");
+      return C2_BAD_VALUE;
+    }
     VkDeviceSize yRange = 0;
     VkDeviceSize uvRange = 0;
     if (!CheckedPlaneRange(destination.planes[0].offset,
@@ -917,6 +901,27 @@ private:
             "creating the NV12 chroma view")) {
       return C2_OMITTED;
     }
+    VkDescriptorSetAllocateInfo descriptorInfo{};
+    descriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    descriptorInfo.descriptorPool = descriptor_pool_;
+    descriptorInfo.descriptorSetCount = 1;
+    descriptorInfo.pSetLayouts = &descriptor_set_layout_;
+    if (!Check(vkAllocateDescriptorSets(device_, &descriptorInfo,
+                                        &resource->descriptor_set),
+               "allocating the NV12 conversion descriptor set")) {
+      return C2_OMITTED;
+    }
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    for (uint32_t plane = 0; plane < writes.size(); ++plane) {
+      writes[plane].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      writes[plane].dstSet = resource->descriptor_set;
+      writes[plane].dstBinding = plane + 1;
+      writes[plane].descriptorCount = 1;
+      writes[plane].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+    }
+    writes[0].pTexelBufferView = &resource->y_view;
+    writes[1].pTexelBufferView = &resource->uv_view;
+    vkUpdateDescriptorSets(device_, writes.size(), writes.data(), 0, nullptr);
     return C2_OK;
   }
 
@@ -966,7 +971,8 @@ private:
     vkCmdBindPipeline(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
                       pipeline_);
     vkCmdBindDescriptorSets(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline_layout_, 0, 1, &descriptor_set_, 0,
+                            pipeline_layout_, 0, 1,
+                            &destinationResource.descriptor_set, 0,
                             nullptr);
     vkCmdPushConstants(command_buffer_, pipeline_layout_,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(parameters),
@@ -1008,10 +1014,13 @@ private:
     }
     // V4L2 has no input fence in this API, so wait without CPU mapping or
     // copying before queueing the same DMA-BUF to Venus.
-    if (!Check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX),
-               "waiting for RGB-to-NV12 conversion")) {
-      (void)vkDeviceWaitIdle(device_);
-      return C2_CORRUPTED;
+    {
+      ATRACE_NAME("floral.encoder.vulkan_wait");
+      if (!Check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX),
+                 "waiting for RGB-to-NV12 conversion")) {
+        (void)vkDeviceWaitIdle(device_);
+        return C2_CORRUPTED;
+      }
     }
     source.layout = VK_IMAGE_LAYOUT_GENERAL;
     return C2_OK;
@@ -1028,6 +1037,10 @@ private:
 
   void DestroyDestination(DestinationResource *resource) const {
     if (device_ != VK_NULL_HANDLE) {
+      if (resource->descriptor_set != VK_NULL_HANDLE) {
+        (void)vkFreeDescriptorSets(device_, descriptor_pool_, 1,
+                                  &resource->descriptor_set);
+      }
       vkDestroyBufferView(device_, resource->uv_view, nullptr);
       vkDestroyBufferView(device_, resource->y_view, nullptr);
       vkDestroyBuffer(device_, resource->buffer, nullptr);
@@ -1046,7 +1059,6 @@ private:
   VkSampler sampler_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout descriptor_set_layout_ = VK_NULL_HANDLE;
   VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
-  VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
   VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline pipeline_ = VK_NULL_HANDLE;
   VkCommandPool command_pool_ = VK_NULL_HANDLE;
@@ -1069,7 +1081,7 @@ VulkanFrameConverter::~VulkanFrameConverter() = default;
 
 c2_status_t VulkanFrameConverter::Initialize() { return impl_->Initialize(); }
 
-c2_status_t VulkanFrameConverter::Convert(const C2ConstGraphicBlock &source,
+c2_status_t VulkanFrameConverter::Convert(const MinigbmDmaBuf &source,
                                           const MinigbmDmaBuf &destination) {
   return impl_->Convert(source, destination);
 }

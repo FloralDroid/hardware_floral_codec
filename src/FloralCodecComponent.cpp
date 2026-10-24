@@ -1487,23 +1487,13 @@ private:
 
   c2_status_t MakeEncodedBuffer(
       const V4l2EncodedFrame &frame,
-      const std::shared_ptr<C2BlockPool> &pool,
       std::shared_ptr<C2Buffer> *buffer,
       std::vector<std::unique_ptr<C2Param>> *updates) {
-    std::shared_ptr<C2LinearBlock> block;
-    const C2MemoryUsage usage = {C2MemoryUsage::CPU_READ,
-                                 C2MemoryUsage::CPU_WRITE};
-    c2_status_t result = pool->fetchLinearBlock(frame.data.size(), usage, &block);
-    if (result != C2_OK) {
-      return result;
+    if (frame.block == nullptr || frame.size == 0) {
+      return C2_BAD_VALUE;
     }
-    C2WriteView view = block->map().get();
-    if (view.error() != C2_OK) {
-      return view.error();
-    }
-    std::memcpy(view.data(), frame.data.data(), frame.data.size());
     *buffer = C2Buffer::CreateLinearBuffer(
-        block->share(0, frame.data.size(), C2Fence()));
+        frame.block->share(0, frame.size, C2Fence()));
     if (frame.key_frame) {
       (*buffer)->setInfo(std::make_shared<C2StreamPictureTypeMaskInfo::output>(
           0u, C2Config::SYNC_FRAME));
@@ -1511,10 +1501,18 @@ private:
 
     if (!encoder_config_sent_) {
       BitstreamCodec codec = BitstreamCodec::kAvc;
+      if (!GetBitstreamCodec(&codec)) {
+        encoder_config_sent_ = true;
+        return C2_OK;
+      }
+      // Only initial codec configuration needs a mapping here. The session
+      // already copied the payload directly into this final Codec2 block.
+      C2ReadView view = frame.block->share(0, frame.size, C2Fence()).map().get();
+      if (view.error() != C2_OK) {
+        return view.error();
+      }
       std::vector<uint8_t> configData;
-      if (GetBitstreamCodec(&codec) &&
-          ExtractCodecConfig(codec, frame.data.data(), frame.data.size(),
-                             &configData)) {
+      if (ExtractCodecConfig(codec, view.data(), frame.size, &configData)) {
         std::unique_ptr<C2StreamInitDataInfo::output> config =
             C2StreamInitDataInfo::output::AllocUnique(configData.size(), 0u);
         if (config == nullptr) {
@@ -1523,12 +1521,10 @@ private:
         std::memcpy(config->m.value, configData.data(), configData.size());
         updates->push_back(std::move(config));
         encoder_config_sent_ = true;
-      } else if (GetBitstreamCodec(&codec) && frame.key_frame) {
+      } else if (frame.key_frame) {
         ALOGE("%s produced a key frame without complete codec configuration",
               spec_.component_name);
         return C2_CORRUPTED;
-      } else if (!GetBitstreamCodec(&codec)) {
-        encoder_config_sent_ = true;
       }
     }
     return C2_OK;
@@ -1542,7 +1538,7 @@ private:
     while (true) {
       V4l2EncodedFrame frame;
       const c2_status_t dequeueResult =
-          session_.DequeueEncoderFrame(&frame, draining && !*sawEos);
+          session_.DequeueEncoderFrame(pool, &frame, draining && !*sawEos);
       if (dequeueResult == C2_NOT_FOUND || dequeueResult == C2_BLOCKING) {
         break;
       }
@@ -1550,7 +1546,7 @@ private:
         return dequeueResult;
       }
       *sawEos = *sawEos || frame.end_of_stream;
-      if (frame.data.empty()) {
+      if (frame.size == 0) {
         if (*sawEos) {
           break;
         }
@@ -1559,7 +1555,7 @@ private:
 
       std::shared_ptr<C2Buffer> buffer;
       std::vector<std::unique_ptr<C2Param>> updates;
-      c2_status_t result = MakeEncodedBuffer(frame, pool, &buffer, &updates);
+      c2_status_t result = MakeEncodedBuffer(frame, &buffer, &updates);
       if (result != C2_OK) {
         return result;
       }

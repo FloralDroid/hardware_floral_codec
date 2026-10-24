@@ -26,7 +26,6 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <vector>
 
 namespace floral::codec {
 
@@ -52,7 +51,9 @@ struct V4l2DecoderSettings {
 };
 
 struct V4l2EncodedFrame {
-  std::vector<uint8_t> data;
+  // Final Codec2 allocation; it never aliases a driver's MMAP capture slot.
+  std::shared_ptr<C2LinearBlock> block;
+  uint32_t size = 0;
   uint64_t frame_index = 0;
   bool key_frame = false;
   bool end_of_stream = false;
@@ -85,7 +86,8 @@ public:
       const std::shared_ptr<C2BlockPool> &conversionPool,
       const std::shared_ptr<C2Buffer> &buffer, uint64_t frameIndex,
       int64_t timestampUs, bool requestSync, uint32_t bitrate);
-  c2_status_t DequeueEncoderFrame(V4l2EncodedFrame *output, bool wait);
+  c2_status_t DequeueEncoderFrame(const std::shared_ptr<C2BlockPool> &pool,
+                                  V4l2EncodedFrame *output, bool wait);
   c2_status_t StartEncoderDrain();
 
   c2_status_t QueueDecoderPacket(const uint8_t *data, size_t size,
