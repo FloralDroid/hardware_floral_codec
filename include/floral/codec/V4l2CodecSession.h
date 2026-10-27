@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -89,6 +90,8 @@ public:
   c2_status_t DequeueEncoderFrame(const std::shared_ptr<C2BlockPool> &pool,
                                   V4l2EncodedFrame *output, bool wait);
   c2_status_t StartEncoderDrain();
+  c2_status_t StartEncoderOutputMonitor(std::function<bool()> requestDrain);
+  c2_status_t RearmEncoderOutputMonitor();
 
   c2_status_t QueueDecoderPacket(const uint8_t *data, size_t size,
                                  uint64_t frameIndex);

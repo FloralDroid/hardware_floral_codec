@@ -1408,7 +1408,11 @@ public:
         }
         return result;
       }
-      return DrainV4l2Encoder(nullptr, pool, false, &sawEos);
+      c2_status_t result = DrainV4l2Encoder(nullptr, pool, false, &sawEos);
+      if (result != C2_OK) {
+        return result;
+      }
+      return session_.RearmEncoderOutputMonitor();
     }
     if (drainMode == DRAIN_COMPONENT_WITH_EOS) {
       c2_status_t result = session_.StartDecoderDrain();
@@ -1610,6 +1614,15 @@ private:
         interface_->ClearSyncRequest();
       }
       if (!eos) {
+        // The notification only queues a drain on this component's work
+        // thread. That runs after process() has published the pending work,
+        // even when the driver completes before this call returns.
+        result = session_.StartEncoderOutputMonitor([this] {
+          return drain_nb(DRAIN_COMPONENT_NO_EOS) == C2_OK;
+        });
+        if (result != C2_OK) {
+          return result;
+        }
         bool ignoredEos = false;
         result = DrainV4l2Encoder(work.get(), pool, false, &ignoredEos);
         if (result != C2_OK) {

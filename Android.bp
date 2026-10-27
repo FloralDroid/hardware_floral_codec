@@ -98,9 +98,11 @@ cc_test_host {
         "tests/H264LevelTest.cpp",
         "tests/V4l2EncoderMetadataTest.cpp",
         "tests/V4l2DecoderGeometryTest.cpp",
+        "tests/V4l2OutputMonitorTest.cpp",
     ],
     local_include_dirs: ["include", "src"],
     static_libs: ["libgtest", "libgtest_main"],
+    header_libs: ["libbase_headers"],
     test_suites: ["general-tests"],
     cflags: [
         "-Wall",

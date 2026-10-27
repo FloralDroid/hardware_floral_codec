@@ -24,6 +24,7 @@
 
 #include "V4l2DecoderGeometry.h"
 #include "V4l2EncoderMetadata.h"
+#include "V4l2OutputMonitor.h"
 
 #include <C2AllocatorGralloc.h>
 #include <C2PlatformSupport.h>
@@ -303,6 +304,7 @@ struct V4l2CodecSession::Impl {
   }
 
   void Close() {
+    encoder_output_monitor.Stop();
     if (fd.get() >= 0) {
       StreamOff(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, &output_streaming);
       StreamOff(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, &capture_streaming);
@@ -1126,6 +1128,10 @@ struct V4l2CodecSession::Impl {
 
   c2_status_t DequeueEncoderFrame(const std::shared_ptr<C2BlockPool> &pool,
                                  V4l2EncodedFrame *output, bool wait) {
+    if (encoder_output_monitor.error() != 0) {
+      errno = encoder_output_monitor.error();
+      return Error("monitoring encoder output");
+    }
     if (output == nullptr) {
       return C2_BAD_VALUE;
     }
@@ -1156,6 +1162,7 @@ struct V4l2CodecSession::Impl {
   }
 
   c2_status_t StartEncoderDrain() {
+    encoder_output_monitor.Stop();
     if (draining) {
       return C2_OK;
     }
@@ -1593,6 +1600,7 @@ struct V4l2CodecSession::Impl {
   CodecSpec spec;
   std::string device_path;
   android::base::unique_fd fd;
+  V4l2OutputMonitor encoder_output_monitor;
   std::optional<V4l2EncoderSettings> encoder_settings;
   std::optional<V4l2DecoderSettings> decoder_settings;
   VulkanFrameConverter frame_converter;
@@ -1659,6 +1667,23 @@ c2_status_t V4l2CodecSession::DequeueEncoderFrame(
 
 c2_status_t V4l2CodecSession::StartEncoderDrain() {
   return impl_->StartEncoderDrain();
+}
+
+c2_status_t V4l2CodecSession::StartEncoderOutputMonitor(
+    std::function<bool()> requestDrain) {
+  if (!impl_->encoder_configured || impl_->draining) {
+    return C2_BAD_STATE;
+  }
+  return impl_->encoder_output_monitor.Start(impl_->fd.get(),
+                                             std::move(requestDrain))
+             ? C2_OK
+             : impl_->Error("starting encoder output monitor");
+}
+
+c2_status_t V4l2CodecSession::RearmEncoderOutputMonitor() {
+  return impl_->encoder_output_monitor.Rearm()
+             ? C2_OK
+             : impl_->Error("rearming encoder output monitor");
 }
 
 c2_status_t V4l2CodecSession::QueueDecoderPacket(const uint8_t *data,
